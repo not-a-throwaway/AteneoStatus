@@ -3,7 +3,7 @@ import re
 import sys
 import datetime
 from datetime import timedelta
-
+import lxml
 import requests
 from bs4 import BeautifulSoup
 
