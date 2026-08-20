@@ -1,9 +1,10 @@
 import os
 import re
 import sys
+import json
 import datetime
 from datetime import timedelta
-import lxml
+
 import requests
 from bs4 import BeautifulSoup
 
@@ -13,6 +14,7 @@ from bs4 import BeautifulSoup
 # ============================================================
 
 ADVISORIES_URL = "https://www.ateneo.edu/advisories"
+FACEBOOK_URL = "https://www.facebook.com/ateneodemanila/"
 
 WEBHOOK_URL = os.environ.get("GOOGLE_CHAT_WEBHOOK")
 
@@ -22,33 +24,116 @@ UA = (
     "Chrome/151.0.0.0 Safari/537.36"
 )
 
+FACEBOOK_LOOKBACK_DAYS = 14
+
+
+# ============================================================
+# GENERIC HELPERS
+# ============================================================
+
+def fetch(url, timeout=30, headers=None):
+    r = requests.get(
+        url,
+        headers=headers or {"User-Agent": UA},
+        timeout=timeout
+    )
+    r.raise_for_status()
+    return r
+
+
+def format_date(date):
+    return date.strftime("%B ") + str(date.day)
+
+
+def parse_date_from_text(text):
+    """
+    Finds dates like:
+      August 12, 2026
+      August 12 2026
+      12 August 2026
+    """
+
+    patterns = [
+        r"\b"
+        r"(January|February|March|April|May|June|July|August|"
+        r"September|October|November|December)"
+        r"\s+(\d{1,2}),?\s+(\d{4})"
+        r"\b",
+
+        r"\b"
+        r"(\d{1,2})\s+"
+        r"(January|February|March|April|May|June|July|August|"
+        r"September|October|November|December)"
+        r"\s+(\d{4})"
+        r"\b",
+    ]
+
+    dates = []
+
+    for pattern in patterns:
+        for match in re.finditer(
+            pattern,
+            text,
+            re.IGNORECASE
+        ):
+            parts = match.groups()
+
+            try:
+                if parts[0].isdigit():
+                    day, month, year = parts
+                    dates.append(
+                        datetime.datetime.strptime(
+                            f"{day} {month} {year}",
+                            "%d %B %Y"
+                        ).date()
+                    )
+                else:
+                    month, day, year = parts
+                    dates.append(
+                        datetime.datetime.strptime(
+                            f"{month} {day} {year}",
+                            "%B %d %Y"
+                        ).date()
+                    )
+            except ValueError:
+                pass
+
+    return dates
+
 
 # ============================================================
 # ATENEO
 # ============================================================
 
 def fetch_advisories():
-    r = requests.get(
-        ADVISORIES_URL,
-        headers={"User-Agent": UA},
-        timeout=30
-    )
-    r.raise_for_status()
+    r = fetch(ADVISORIES_URL)
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    article = soup.select_one("article.node--type-page")
+    soup = BeautifulSoup(
+        r.text,
+        "html.parser"
+    )
+
+    article = soup.select_one(
+        "article.node--type-page"
+    )
 
     if not article:
-        raise RuntimeError("Could not find the Ateneo advisories article.")
+        raise RuntimeError(
+            "Could not find the Ateneo advisories article."
+        )
 
     return article
 
 
 def find_advisory_date(article):
-    text = article.get_text(" ", strip=True)
+    text = article.get_text(
+        " ",
+        strip=True
+    )
 
     pattern = (
-        r"\b(\d{1,2})\s+"
+        r"\b"
+        r"(\d{1,2})\s+"
         r"(January|February|March|April|May|June|July|August|"
         r"September|October|November|December)\s+"
         r"(\d{4})\b"
@@ -57,7 +142,9 @@ def find_advisory_date(article):
     dates = []
 
     for day, month, year in re.findall(
-        pattern, text, re.IGNORECASE
+        pattern,
+        text,
+        re.IGNORECASE
     ):
         try:
             dates.append(
@@ -70,7 +157,9 @@ def find_advisory_date(article):
             pass
 
     if not dates:
-        raise RuntimeError("Could not find an advisory date.")
+        raise RuntimeError(
+            "Could not find an Ateneo advisory date."
+        )
 
     return max(dates)
 
@@ -105,7 +194,10 @@ def get_school_section(text, school):
             re.IGNORECASE
         )
 
-        if m and (start is None or m.start() < start):
+        if m and (
+            start is None
+            or m.start() < start
+        ):
             start = m.start()
             start_len = len(m.group())
 
@@ -127,15 +219,34 @@ def get_school_section(text, school):
             )
 
             if m:
-                ends.append(section_start + m.start())
+                ends.append(
+                    section_start + m.start()
+                )
 
     end = min(ends) if ends else len(text)
 
     return text[start:end].strip()
 
 
+# ============================================================
+# ATENEO CLASSIFIER
+# ============================================================
+# This is the previous classifier again.
+# It may correctly detect yesterday's online mode.
+# We ONLY use its result when the advisory date is TODAY.
+# ============================================================
+
 def classify(text):
     text = text.lower()
+
+    # Ignore conditional suspension wording.
+    text = re.sub(
+        r"if .*?(?:declares?|declare).*?"
+        r"(?:class suspension|suspension).*?(?:\.|$)",
+        " ",
+        text,
+        flags=re.IGNORECASE
+    )
 
     synchronous = [
         r"\bonline synchronous\b",
@@ -144,7 +255,9 @@ def classify(text):
         r"\bsynchronous session\b",
         r"\bsynchronous instruction\b",
         r"\bsynchronous modality\b",
-        r"\bsynchronous learning\b"
+        r"\bsynchronous learning\b",
+        r"\bonline.*synchronous\b",
+        r"\bsynchronous.*online\b"
     ]
 
     asynchronous = [
@@ -157,11 +270,25 @@ def classify(text):
         r"\basynchronous instruction\b",
         r"\basynchronous work\b",
         r"\basynchronous learning\b",
-        r"\basynchronous activities\b"
+        r"\basynchronous activities\b",
+        r"\bcontinue.*asynchronous\b"
     ]
 
-    has_sync = any(re.search(x, text) for x in synchronous)
-    has_async = any(re.search(x, text) for x in asynchronous)
+    has_sync = any(
+        re.search(
+            x,
+            text
+        )
+        for x in synchronous
+    )
+
+    has_async = any(
+        re.search(
+            x,
+            text
+        )
+        for x in asynchronous
+    )
 
     if has_sync and has_async:
         return "Mixed Online"
@@ -184,7 +311,10 @@ def classify(text):
         r"\ball classes are suspended\b"
     ]
 
-    if any(re.search(x, text) for x in suspension):
+    if any(
+        re.search(x, text)
+        for x in suspension
+    ):
         return "Suspension"
 
     online = [
@@ -196,7 +326,10 @@ def classify(text):
         r"\bvirtual instruction\b"
     ]
 
-    if any(re.search(x, text) for x in online):
+    if any(
+        re.search(x, text)
+        for x in online
+    ):
         return "Online"
 
     onsite = [
@@ -210,42 +343,71 @@ def classify(text):
         r"\bresume.*onsite classes\b"
     ]
 
-    if any(re.search(x, text) for x in onsite):
+    if any(
+        re.search(x, text)
+        for x in onsite
+    ):
         return "Onsite"
 
-    return "Unknown"
+    # Normal default.
+    return "Onsite"
 
 
 def get_statuses(article):
-    text = article.get_text(" ", strip=True)
+    text = article.get_text(
+        " ",
+        strip=True
+    )
+
     statuses = {}
 
-    for school in ("AGS", "JHS", "SHS"):
-        section = get_school_section(text, school)
+    for school in (
+        "AGS",
+        "JHS",
+        "SHS"
+    ):
+        section = get_school_section(
+            text,
+            school
+        )
+
         statuses[school] = classify(section)
 
-        print(f"[DEBUG] {school}: {statuses[school]}")
+        print(
+            f"[DEBUG] {school}: "
+            f"{statuses[school]}"
+        )
 
     return statuses
 
 
 # ============================================================
-# QC GOVERNMENT CHECK
+# QC GOVERNMENT
 # ============================================================
 
 def check_qc_government_feed(target_date):
     rss_url = "https://quezoncity.gov.ph/feed/"
     fallback_url = "https://quezoncity.gov.ph/news/"
 
-    headers = {"User-Agent": UA}
-
-    day = str(target_date.day)
+    headers = {
+        "User-Agent": UA
+    }
 
     date_strings = {
-        f"{target_date.strftime('%B')} {day} {target_date.year}".lower(),
-        f"{target_date.strftime('%B')} {day}".lower(),
-        target_date.strftime("%B-%d-%Y").lower(),
-        f"{target_date.strftime('%B')}-{day}-{target_date.year}".lower()
+        f"{target_date.strftime('%B')} "
+        f"{target_date.day} "
+        f"{target_date.year}".lower(),
+
+        f"{target_date.strftime('%B')} "
+        f"{target_date.day}".lower(),
+
+        target_date.strftime(
+            "%B-%d-%Y"
+        ).lower(),
+
+        f"{target_date.strftime('%B')}-"
+        f"{target_date.day}-"
+        f"{target_date.year}".lower(),
     }
 
     suspension_words = [
@@ -258,84 +420,122 @@ def check_qc_government_feed(target_date):
     private_words = [
         "private schools",
         "private school",
-        "pribadong paaralan",
-        "pribadong paaralan."
+        "pribadong paaralan"
     ]
 
     def inspect(text, title=""):
-        combined = f"{title} {text}".lower()
+        combined = (
+            title + " " + text
+        ).lower()
 
-        if not any(x in combined for x in date_strings):
+        if not any(
+            x in combined
+            for x in date_strings
+        ):
             return None
 
-        if not any(x in combined for x in suspension_words):
+        if not any(
+            x in combined
+            for x in suspension_words
+        ):
             return None
 
-        # PUBLIC-ONLY announcements do NOT count.
-        if not any(x in combined for x in private_words):
+        # IMPORTANT:
+        # Public-only announcements do NOT count.
+        if not any(
+            x in combined
+            for x in private_words
+        ):
             return None
 
         return (
             True,
-            f"Private-school suspension: {title}".strip()
+            f"Private-school suspension: "
+            f"{title}".strip()
         )
 
     # ---------------- RSS ----------------
 
     try:
-        r = requests.get(
+        r = fetch(
             rss_url,
-            headers=headers,
             timeout=10
         )
 
-        if r.status_code == 200:
-            soup = BeautifulSoup(r.text, "xml")
+        soup = BeautifulSoup(
+            r.text,
+            "xml"
+        )
 
-            for item in soup.find_all("item"):
-                title = item.title.text if item.title else ""
-                content = (
-                    item.description.text
-                    if item.description
-                    else ""
-                )
+        for item in soup.find_all("item"):
+            title = (
+                item.title.text
+                if item.title
+                else ""
+            )
 
-                result = inspect(content, title)
+            content = (
+                item.description.text
+                if item.description
+                else ""
+            )
 
-                if result:
-                    return result
+            result = inspect(
+                content,
+                title
+            )
+
+            if result:
+                return result
 
     except Exception as e:
-        print(f"QC RSS check failed: {e}", file=sys.stderr)
+        print(
+            f"QC RSS check failed: {e}",
+            file=sys.stderr
+        )
 
     # ---------------- FALLBACK ----------------
 
     try:
-        r = requests.get(
+        r = fetch(
             fallback_url,
-            headers=headers,
             timeout=10
         )
 
-        if r.status_code == 200:
-            soup = BeautifulSoup(r.text, "html.parser")
+        soup = BeautifulSoup(
+            r.text,
+            "html.parser"
+        )
 
-            for link in soup.find_all("a"):
-                href = link.get("href", "")
-                text = link.get_text(" ", strip=True)
+        for link in soup.find_all("a"):
+            href = link.get(
+                "href",
+                ""
+            )
 
-                result = inspect(
-                    text + " " + href,
-                    text
-                )
+            text = link.get_text(
+                " ",
+                strip=True
+            )
 
-                if result:
-                    return result
+            result = inspect(
+                text + " " + href,
+                text
+            )
+
+            if result:
+                return result
 
     except Exception as e:
-        print(f"QC fallback failed: {e}", file=sys.stderr)
+        print(
+            f"QC fallback failed: {e}",
+            file=sys.stderr
+        )
 
-    return False, "No matching private-school suspension."
+    return (
+        False,
+        "No matching private-school suspension."
+    )
 
 
 # ============================================================
@@ -343,17 +543,15 @@ def check_qc_government_feed(target_date):
 # ============================================================
 
 def check_pagasa_bulletin(target_date):
-    url = "https://bagong.pagasa.dost.gov.ph/weather"
+    url = (
+        "https://bagong.pagasa.dost.gov.ph/weather"
+    )
 
     try:
-        r = requests.get(
+        r = fetch(
             url,
-            headers={"User-Agent": UA},
             timeout=10
         )
-
-        if r.status_code != 200:
-            return False, "PAGASA unavailable."
 
         html = r.text.lower()
 
@@ -361,7 +559,10 @@ def check_pagasa_bulletin(target_date):
             "metro manila" not in html
             and "quezon city" not in html
         ):
-            return False, "No NCR PAGASA trigger."
+            return (
+                False,
+                "No NCR PAGASA trigger."
+            )
 
         signal_3 = any(
             f"signal no. {i}" in html
@@ -405,11 +606,176 @@ def check_pagasa_bulletin(target_date):
             file=sys.stderr
         )
 
-    return False, "No relevant PAGASA trigger."
+    return (
+        False,
+        "No relevant PAGASA trigger."
+    )
 
 
 # ============================================================
-# ICONS
+# FACEBOOK
+# ============================================================
+# Best-effort because Facebook may require login.
+#
+# We look back 14 days and try to find:
+# - visible post text
+# - visible dates
+# - private-school suspension language
+#
+# If Facebook returns a login/block page, it simply gets
+# ignored rather than breaking the bot.
+# ============================================================
+
+def check_facebook(target_date):
+    cutoff = (
+        target_date -
+        timedelta(days=FACEBOOK_LOOKBACK_DAYS)
+    )
+
+    headers = {
+        "User-Agent": UA,
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        r = requests.get(
+            FACEBOOK_URL,
+            headers=headers,
+            timeout=20
+        )
+
+        if r.status_code != 200:
+            print(
+                f"Facebook returned HTTP {r.status_code}"
+            )
+            return None
+
+        soup = BeautifulSoup(
+            r.text,
+            "html.parser"
+        )
+
+        raw_text = soup.get_text(
+            " ",
+            strip=True
+        )
+
+        lower = raw_text.lower()
+
+        # Facebook login/block pages are not useful.
+        if (
+            "log in" in lower
+            and len(raw_text) < 5000
+        ):
+            print(
+                "Facebook: login page returned."
+            )
+            return None
+
+        # Remove scripts/styles and collect useful text.
+        for tag in soup([
+            "script",
+            "style",
+            "noscript"
+        ]):
+            tag.decompose()
+
+        pieces = []
+
+        for tag in soup.find_all([
+            "article",
+            "div",
+            "p",
+            "span"
+        ]):
+            text = tag.get_text(
+                " ",
+                strip=True
+            )
+
+            if (
+                text
+                and len(text) >= 20
+                and text not in pieces
+            ):
+                pieces.append(text)
+
+        # We can inspect up to roughly the first chunk of
+        # visible Facebook content.
+        content = "\n".join(
+            pieces[:1000]
+        )
+
+        content_lower = content.lower()
+
+        # ----------------------------------------------------
+        # Look for explicit private-school suspension terms
+        # ----------------------------------------------------
+
+        suspension_words = [
+            "private schools",
+            "private school",
+            "pribadong paaralan"
+        ]
+
+        suspension_action = [
+            "suspended",
+            "suspension",
+            "suspendido",
+            "walang pasok",
+            "no classes"
+        ]
+
+        if not any(
+            x in content_lower
+            for x in suspension_words
+        ):
+            return None
+
+        if not any(
+            x in content_lower
+            for x in suspension_action
+        ):
+            return None
+
+        # ----------------------------------------------------
+        # Collect dates visible on page
+        # ----------------------------------------------------
+
+        dates = parse_date_from_text(
+            content
+        )
+
+        recent_dates = [
+            d for d in dates
+            if cutoff <= d <= target_date
+        ]
+
+        if not recent_dates:
+            return None
+
+        newest = max(recent_dates)
+
+        return {
+            "private_suspended": True,
+            "date": newest,
+            "reason": (
+                "Facebook private-school "
+                "suspension detected."
+            ),
+        }
+
+    except Exception as e:
+        print(
+            f"Facebook check failed: {e}",
+            file=sys.stderr
+        )
+
+    return None
+
+
+# ============================================================
+# STATUS ICONS
 # ============================================================
 
 def status_icon(status):
@@ -422,19 +788,25 @@ def status_icon(status):
         "No School": "🔴",
         "Onsite": "🔵",
         "Unknown": "🟡"
-    }.get(status, "🟡")
-
-
-def format_date(date):
-    return date.strftime("%B ") + str(date.day)
+    }.get(
+        status,
+        "🟡"
+    )
 
 
 # ============================================================
-# MESSAGE
+# GOOGLE CHAT MESSAGE
 # ============================================================
 
-def create_message(date, statuses, suspension_reason=None):
-    next_date = date + timedelta(days=1)
+def create_message(
+    date,
+    statuses,
+    suspension_reason=None
+):
+    next_date = (
+        date +
+        timedelta(days=1)
+    )
 
     date1 = format_date(date)
     date2 = format_date(next_date)
@@ -449,32 +821,33 @@ def create_message(date, statuses, suspension_reason=None):
         (
             f"*AGS* | "
             f"{status_icon(statuses['AGS'])} "
-            f"{statuses['AGS']} | 🟡 Unknown"
+            f"{statuses['AGS']} | "
+            f"🟡 Unknown"
         ),
         (
             f"*JHS* | "
             f"{status_icon(statuses['JHS'])} "
-            f"{statuses['JHS']} | 🟡 Unknown"
+            f"{statuses['JHS']} | "
+            f"🟡 Unknown"
         ),
         (
             f"*SHS* | "
             f"{status_icon(statuses['SHS'])} "
-            f"{statuses['SHS']} | 🟡 Unknown"
-        )
+            f"{statuses['SHS']} | "
+            f"🟡 Unknown"
+        ),
     ]
 
     if suspension_reason:
         lines += [
             "",
             "🚨 *Private schools are suspended.*",
-            suspension_reason
+            suspension_reason,
         ]
 
     lines += [
         "",
         f"🔗 {ADVISORIES_URL}",
-        f"🔗 https://bagong.pagasa.dost.gov.ph/weather",
-        f"🔗 https://quezoncity.gov.ph/feed/"
     ]
 
     return "\n".join(lines)
@@ -506,11 +879,30 @@ def send_to_google_chat(message):
 def check_once():
     today = datetime.date.today()
 
-    print("==========================================")
-    print("Ateneo School Status Bot")
-    print(f"Today's date: {today}")
-    print(f"Advisories: {ADVISORIES_URL}")
-    print("==========================================")
+    print(
+        "=========================================="
+    )
+
+    print(
+        "Ateneo School Status Bot"
+    )
+
+    print(
+        f"Today's date: {format_date(today)}"
+    )
+
+    print(
+        f"Advisories: {ADVISORIES_URL}"
+    )
+
+    print(
+        f"Facebook lookback: "
+        f"{FACEBOOK_LOOKBACK_DAYS} days"
+    )
+
+    print(
+        "=========================================="
+    )
 
     # --------------------------------------------------------
     # ATENEO
@@ -518,32 +910,39 @@ def check_once():
 
     article = fetch_advisories()
 
-    advisory_date = find_advisory_date(article)
+    advisory_date = find_advisory_date(
+        article
+    )
 
     print(
         f"Ateneo page advisory date: "
         f"{format_date(advisory_date)}"
     )
 
-    # CRITICAL:
-    # Only use Ateneo statuses when the advisory
-    # is actually dated TODAY.
     if advisory_date == today:
-        print("Ateneo advisory matches today: True")
 
-        statuses = get_statuses(article)
+        print(
+            "Ateneo advisory matches today: True"
+        )
+
+        statuses = get_statuses(
+            article
+        )
+
         aten_status_valid = True
 
     else:
-        print("Ateneo advisory matches today: False")
+
         print(
-            ">> Ateneo statuses ignored because "
-            "the advisory is for another date."
-        )
-        print(
-            ">> Defaulting today's status to Face-to-Face."
+            "Ateneo advisory matches today: False"
         )
 
+        print(
+            ">> Ignoring Ateneo statuses because "
+            "the advisory is for another date."
+        )
+
+        # Our normal-school default.
         statuses = {
             "AGS": "Onsite",
             "JHS": "Onsite",
@@ -553,38 +952,97 @@ def check_once():
         aten_status_valid = False
 
     # --------------------------------------------------------
-    # IF ATENEO IS NOT TODAY:
-    # CHECK QC + PAGASA
+    # QC
     # --------------------------------------------------------
 
-    private_suspended, qc_reason = (
-        check_qc_government_feed(today)
-    )
-
-    pagasa_suspended, pagasa_reason = (
-        check_pagasa_bulletin(today)
+    qc_private, qc_reason = (
+        check_qc_government_feed(
+            today
+        )
     )
 
     print(
-        f"Private-school suspension: "
-        f"{private_suspended}"
+        f"Private-school suspension (QC): "
+        f"{qc_private}"
     )
 
-    print(f"QC: {qc_reason}")
-    print(f"PAGASA: {pagasa_reason}")
+    print(
+        f"QC: {qc_reason}"
+    )
 
     # --------------------------------------------------------
-    # GENERAL NO-SCHOOL OVERRIDE
-    #
-    # ONLY PRIVATE SCHOOL SUSPENSION COUNTS.
-    # Public-school suspension does NOT.
+    # PAGASA
     # --------------------------------------------------------
 
-    if not aten_status_valid and private_suspended:
-        print(
-            ">> No School override: "
-            "private schools are suspended."
+    _, pagasa_reason = (
+        check_pagasa_bulletin(
+            today
         )
+    )
+
+    print(
+        f"PAGASA: {pagasa_reason}"
+    )
+
+    # --------------------------------------------------------
+    # FACEBOOK — 2 WEEK LOOKBACK
+    # --------------------------------------------------------
+
+    facebook_result = check_facebook(
+        today
+    )
+
+    if facebook_result:
+        facebook_private = True
+
+        print(
+            "Facebook: private-school "
+            "suspension found."
+        )
+
+        print(
+            f"Facebook date: "
+            f"{format_date(facebook_result['date'])}"
+        )
+
+    else:
+        facebook_private = False
+
+        print(
+            "Facebook: no usable private-school "
+            "suspension found."
+        )
+
+    # --------------------------------------------------------
+    # PRIVATE SCHOOL OVERRIDE
+    #
+    # ONLY private-school suspension matters.
+    #
+    # If today's Ateneo advisory exists:
+    #   use Ateneo.
+    #
+    # If it doesn't:
+    #   default F2F unless private suspension found.
+    # --------------------------------------------------------
+
+    private_suspended = (
+        qc_private
+        or facebook_private
+    )
+
+    if private_suspended:
+
+        print(
+            ">>> PRIVATE SCHOOL SUSPENSION "
+            "DETECTED."
+        )
+
+        if qc_private:
+            reason = qc_reason
+        else:
+            reason = facebook_result[
+                "reason"
+            ]
 
         statuses = {
             "AGS": "No School",
@@ -592,22 +1050,25 @@ def check_once():
             "SHS": "No School"
         }
 
-        suspension_reason = qc_reason
-
-    elif not aten_status_valid:
-        print(
-            ">> No School override skipped: "
-            "no private-school suspension."
-        )
-
-        suspension_reason = None
+        suspension_reason = reason
 
     else:
-        # Today's Ateneo advisory wins.
+
         suspension_reason = None
 
+        if aten_status_valid:
+            print(
+                ">>> Using today's Ateneo "
+                "advisory."
+            )
+        else:
+            print(
+                ">>> No current Ateneo advisory."
+                " Defaulting to Face-to-Face."
+            )
+
     # --------------------------------------------------------
-    # SEND EVERY TIME
+    # SEND EVERY RUN
     # --------------------------------------------------------
 
     message = create_message(
@@ -620,9 +1081,13 @@ def check_once():
     print(message)
     print("")
 
-    send_to_google_chat(message)
+    send_to_google_chat(
+        message
+    )
 
-    print("Sent update to Google Chat.")
+    print(
+        "Sent update to Google Chat."
+    )
 
 
 # ============================================================
@@ -632,6 +1097,10 @@ def check_once():
 if __name__ == "__main__":
     try:
         check_once()
+
     except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
+        print(
+            f"ERROR: {e}",
+            file=sys.stderr
+        )
         sys.exit(1)
