@@ -1,11 +1,11 @@
 import os
 import re
 import sys
-import json
 import datetime
 from datetime import timedelta
 
 import requests
+import holidays
 from bs4 import BeautifulSoup
 
 
@@ -81,24 +81,75 @@ def parse_date_from_text(text):
             try:
                 if parts[0].isdigit():
                     day, month, year = parts
+
                     dates.append(
                         datetime.datetime.strptime(
                             f"{day} {month} {year}",
                             "%d %B %Y"
                         ).date()
                     )
+
                 else:
                     month, day, year = parts
+
                     dates.append(
                         datetime.datetime.strptime(
                             f"{month} {day} {year}",
                             "%B %d %Y"
                         ).date()
                     )
+
             except ValueError:
                 pass
 
     return dates
+
+
+# ============================================================
+# PHILIPPINE HOLIDAYS / WEEKENDS
+# ============================================================
+
+def check_ph_calendar(target_date):
+    """
+    Automatically treats:
+      - Saturday
+      - Sunday
+      - Philippine national holidays
+
+    as no-class days.
+
+    Returns:
+        (True, reason)  -> No classes
+        (False, None)   -> Normal school day
+    """
+
+    # Saturday = 5
+    # Sunday   = 6
+    if target_date.weekday() >= 5:
+        return (
+            True,
+            "Weekend"
+        )
+
+    ph_holidays = holidays.country_holidays(
+        "PH",
+        years=target_date.year
+    )
+
+    if target_date in ph_holidays:
+        holiday_name = ph_holidays.get(
+            target_date
+        )
+
+        return (
+            True,
+            f"Philippine holiday: {holiday_name}"
+        )
+
+    return (
+        False,
+        None
+    )
 
 
 # ============================================================
@@ -153,6 +204,7 @@ def find_advisory_date(article):
                     "%d %B %Y"
                 ).date()
             )
+
         except ValueError:
             pass
 
@@ -170,11 +222,13 @@ ALIASES = {
         "Ateneo Grade School",
         "Ateneo Grade School (AGS)"
     ],
+
     "JHS": [
         "AJHS",
         "Ateneo Junior High School",
         "Ateneo Junior High School (AJHS)"
     ],
+
     "SHS": [
         "ASHS",
         "Ateneo Senior High School",
@@ -231,10 +285,6 @@ def get_school_section(text, school):
 # ============================================================
 # ATENEO CLASSIFIER
 # ============================================================
-# This is the previous classifier again.
-# It may correctly detect yesterday's online mode.
-# We ONLY use its result when the advisory date is TODAY.
-# ============================================================
 
 def classify(text):
     text = text.lower()
@@ -275,18 +325,12 @@ def classify(text):
     ]
 
     has_sync = any(
-        re.search(
-            x,
-            text
-        )
+        re.search(x, text)
         for x in synchronous
     )
 
     has_async = any(
-        re.search(
-            x,
-            text
-        )
+        re.search(x, text)
         for x in asynchronous
     )
 
@@ -349,7 +393,6 @@ def classify(text):
     ):
         return "Onsite"
 
-    # Normal default.
     return "Onsite"
 
 
@@ -440,7 +483,6 @@ def check_qc_government_feed(target_date):
         ):
             return None
 
-        # IMPORTANT:
         # Public-only announcements do NOT count.
         if not any(
             x in combined
@@ -459,7 +501,8 @@ def check_qc_government_feed(target_date):
     try:
         r = fetch(
             rss_url,
-            timeout=10
+            timeout=10,
+            headers=headers
         )
 
         soup = BeautifulSoup(
@@ -499,7 +542,8 @@ def check_qc_government_feed(target_date):
     try:
         r = fetch(
             fallback_url,
-            timeout=10
+            timeout=10,
+            headers=headers
         )
 
         soup = BeautifulSoup(
@@ -615,16 +659,6 @@ def check_pagasa_bulletin(target_date):
 # ============================================================
 # FACEBOOK
 # ============================================================
-# Best-effort because Facebook may require login.
-#
-# We look back 14 days and try to find:
-# - visible post text
-# - visible dates
-# - private-school suspension language
-#
-# If Facebook returns a login/block page, it simply gets
-# ignored rather than breaking the bot.
-# ============================================================
 
 def check_facebook(target_date):
     cutoff = (
@@ -672,7 +706,7 @@ def check_facebook(target_date):
             )
             return None
 
-        # Remove scripts/styles and collect useful text.
+        # Remove scripts/styles.
         for tag in soup([
             "script",
             "style",
@@ -700,8 +734,6 @@ def check_facebook(target_date):
             ):
                 pieces.append(text)
 
-        # We can inspect up to roughly the first chunk of
-        # visible Facebook content.
         content = "\n".join(
             pieces[:1000]
         )
@@ -709,7 +741,7 @@ def check_facebook(target_date):
         content_lower = content.lower()
 
         # ----------------------------------------------------
-        # Look for explicit private-school suspension terms
+        # Explicit private-school suspension terms
         # ----------------------------------------------------
 
         suspension_words = [
@@ -785,7 +817,7 @@ def status_icon(status):
         "Mixed Online": "🟢",
         "Online": "🟢",
         "Suspension": "🔴",
-        "No School": "🔴",
+        "No School": "❌",
         "Onsite": "🔵",
         "Unknown": "🟡"
     }.get(
@@ -801,7 +833,8 @@ def status_icon(status):
 def create_message(
     date,
     statuses,
-    suspension_reason=None
+    reason=None,
+    reason_type=None
 ):
     next_date = (
         date +
@@ -838,12 +871,22 @@ def create_message(
         ),
     ]
 
-    if suspension_reason:
+    if reason:
         lines += [
             "",
-            "🚨 *Private schools are suspended.*",
-            suspension_reason,
         ]
+
+        if reason_type == "calendar":
+            lines += [
+                "🚨 *NO CLASSES.*",
+                reason,
+            ]
+
+        else:
+            lines += [
+                "🚨 *Private schools are suspended.*",
+                reason,
+            ]
 
     lines += [
         "",
@@ -905,6 +948,64 @@ def check_once():
     )
 
     # --------------------------------------------------------
+    # PHILIPPINE CALENDAR
+    # --------------------------------------------------------
+
+    calendar_no_classes, calendar_reason = (
+        check_ph_calendar(today)
+    )
+
+    print(
+        "Philippine calendar: "
+        f"{calendar_reason if calendar_no_classes else 'Normal school day'}"
+    )
+
+    # --------------------------------------------------------
+    # WEEKEND / HOLIDAY OVERRIDE
+    # --------------------------------------------------------
+    #
+    # This has the highest priority.
+    #
+    # Saturday/Sunday/PH holiday:
+    #     ❌ No School
+    #
+    # No need to check Ateneo, QC, PAGASA, or Facebook.
+    # --------------------------------------------------------
+
+    if calendar_no_classes:
+
+        print(
+            f">>> NO CLASSES: {calendar_reason}"
+        )
+
+        statuses = {
+            "AGS": "No School",
+            "JHS": "No School",
+            "SHS": "No School"
+        }
+
+        message = create_message(
+            today,
+            statuses,
+            reason=calendar_reason,
+            reason_type="calendar"
+        )
+
+        print("")
+        print(message)
+        print("")
+
+        send_to_google_chat(
+            message
+        )
+
+        print(
+            "Sent update to Google Chat."
+        )
+
+        return
+
+    # --------------------------------------------------------
     # ATENEO
     # --------------------------------------------------------
 
@@ -942,7 +1043,6 @@ def check_once():
             "the advisory is for another date."
         )
 
-        # Our normal-school default.
         statuses = {
             "AGS": "Onsite",
             "JHS": "Onsite",
@@ -985,7 +1085,7 @@ def check_once():
     )
 
     # --------------------------------------------------------
-    # FACEBOOK — 2 WEEK LOOKBACK
+    # FACEBOOK
     # --------------------------------------------------------
 
     facebook_result = check_facebook(
@@ -993,6 +1093,7 @@ def check_once():
     )
 
     if facebook_result:
+
         facebook_private = True
 
         print(
@@ -1006,6 +1107,7 @@ def check_once():
         )
 
     else:
+
         facebook_private = False
 
         print(
@@ -1015,14 +1117,6 @@ def check_once():
 
     # --------------------------------------------------------
     # PRIVATE SCHOOL OVERRIDE
-    #
-    # ONLY private-school suspension matters.
-    #
-    # If today's Ateneo advisory exists:
-    #   use Ateneo.
-    #
-    # If it doesn't:
-    #   default F2F unless private suspension found.
     # --------------------------------------------------------
 
     private_suspended = (
@@ -1051,20 +1145,25 @@ def check_once():
         }
 
         suspension_reason = reason
+        reason_type = "suspension"
 
     else:
 
         suspension_reason = None
+        reason_type = None
 
         if aten_status_valid:
+
             print(
                 ">>> Using today's Ateneo "
                 "advisory."
             )
+
         else:
+
             print(
-                ">>> No current Ateneo advisory."
-                " Defaulting to Face-to-Face."
+                ">>> No current Ateneo advisory. "
+                "Defaulting to Face-to-Face."
             )
 
     # --------------------------------------------------------
@@ -1074,7 +1173,8 @@ def check_once():
     message = create_message(
         today,
         statuses,
-        suspension_reason
+        reason=suspension_reason,
+        reason_type=reason_type
     )
 
     print("")
@@ -1103,4 +1203,5 @@ if __name__ == "__main__":
             f"ERROR: {e}",
             file=sys.stderr
         )
+
         sys.exit(1)
