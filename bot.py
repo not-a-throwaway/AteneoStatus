@@ -111,25 +111,57 @@ def parse_date_from_text(text):
 
 def check_ph_calendar(target_date):
     """
-    Automatically treats:
-      - Saturday
-      - Sunday
-      - Philippine national holidays
-
-    as no-class days.
-
     Returns:
         (True, reason)  -> No classes
         (False, None)   -> Normal school day
+
+    Priority:
+        1. Weekend
+        2. Explicit recurring Philippine special days
+        3. holidays package
     """
 
-    # Saturday = 5
-    # Sunday   = 6
+    # --------------------------------------------------------
+    # WEEKENDS
+    # --------------------------------------------------------
+
     if target_date.weekday() >= 5:
         return (
             True,
             "Weekend"
         )
+
+    # --------------------------------------------------------
+    # EXPLICIT RECURRING PHILIPPINE SPECIAL DAYS
+    #
+    # These are hard-coded intentionally so that important
+    # recurring special non-working days don't depend entirely
+    # on the holidays package.
+    # --------------------------------------------------------
+
+    recurring_special_days = {
+        (8, 21): "Ninoy Aquino Day",
+        (11, 1): "All Saints' Day",
+        (12, 8): "Feast of the Immaculate Conception",
+        (12, 24): "Christmas Eve",
+        (12, 31): "Last Day of the Year",
+    }
+
+    key = (
+        target_date.month,
+        target_date.day
+    )
+
+    if key in recurring_special_days:
+        return (
+            True,
+            "Philippine special non-working day: "
+            + recurring_special_days[key]
+        )
+
+    # --------------------------------------------------------
+    # HOLIDAYS PACKAGE
+    # --------------------------------------------------------
 
     ph_holidays = holidays.country_holidays(
         "PH",
@@ -483,7 +515,6 @@ def check_qc_government_feed(target_date):
         ):
             return None
 
-        # Public-only announcements do NOT count.
         if not any(
             x in combined
             for x in private_words
@@ -696,7 +727,6 @@ def check_facebook(target_date):
 
         lower = raw_text.lower()
 
-        # Facebook login/block pages are not useful.
         if (
             "log in" in lower
             and len(raw_text) < 5000
@@ -706,7 +736,6 @@ def check_facebook(target_date):
             )
             return None
 
-        # Remove scripts/styles.
         for tag in soup([
             "script",
             "style",
@@ -740,10 +769,6 @@ def check_facebook(target_date):
 
         content_lower = content.lower()
 
-        # ----------------------------------------------------
-        # Explicit private-school suspension terms
-        # ----------------------------------------------------
-
         suspension_words = [
             "private schools",
             "private school",
@@ -769,10 +794,6 @@ def check_facebook(target_date):
             for x in suspension_action
         ):
             return None
-
-        # ----------------------------------------------------
-        # Collect dates visible on page
-        # ----------------------------------------------------
 
         dates = parse_date_from_text(
             content
@@ -872,26 +893,24 @@ def create_message(
     ]
 
     if reason:
-        lines += [
-            "",
-        ]
+        lines.append("")
 
         if reason_type == "calendar":
-            lines += [
+            lines.extend([
                 "🚨 *NO CLASSES.*",
                 reason,
-            ]
+            ])
 
         else:
-            lines += [
+            lines.extend([
                 "🚨 *Private schools are suspended.*",
                 reason,
-            ]
+            ])
 
-    lines += [
+    lines.extend([
         "",
         f"🔗 {ADVISORIES_URL}",
-    ]
+    ])
 
     return "\n".join(lines)
 
@@ -957,19 +976,23 @@ def check_once():
 
     print(
         "Philippine calendar: "
-        f"{calendar_reason if calendar_no_classes else 'Normal school day'}"
+        + (
+            calendar_reason
+            if calendar_no_classes
+            else "Normal school day"
+        )
     )
 
     # --------------------------------------------------------
-    # WEEKEND / HOLIDAY OVERRIDE
+    # WEEKEND / PHILIPPINE HOLIDAY OVERRIDE
     # --------------------------------------------------------
     #
-    # This has the highest priority.
+    # THIS IS THE HIGHEST PRIORITY.
     #
-    # Saturday/Sunday/PH holiday:
+    # Saturday/Sunday/holiday:
     #     ❌ No School
     #
-    # No need to check Ateneo, QC, PAGASA, or Facebook.
+    # No other source is allowed to override this.
     # --------------------------------------------------------
 
     if calendar_no_classes:
@@ -1133,6 +1156,7 @@ def check_once():
 
         if qc_private:
             reason = qc_reason
+
         else:
             reason = facebook_result[
                 "reason"
