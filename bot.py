@@ -3,6 +3,7 @@ import re
 import sys
 import datetime
 from datetime import timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 import holidays
@@ -26,6 +27,27 @@ UA = (
 
 FACEBOOK_LOOKBACK_DAYS = 14
 
+# IMPORTANT:
+# Always use Philippine time, even when running in GitHub Actions.
+PH_TIMEZONE = ZoneInfo("Asia/Manila")
+
+
+# ============================================================
+# TIME
+# ============================================================
+
+def get_ph_date():
+    """
+    Returns today's date according to Philippine time.
+
+    This prevents UTC-based workflow runners from using
+    yesterday's date around midnight in the Philippines.
+    """
+
+    return datetime.datetime.now(
+        PH_TIMEZONE
+    ).date()
+
 
 # ============================================================
 # GENERIC HELPERS
@@ -37,7 +59,9 @@ def fetch(url, timeout=30, headers=None):
         headers=headers or {"User-Agent": UA},
         timeout=timeout
     )
+
     r.raise_for_status()
+
     return r
 
 
@@ -132,11 +156,10 @@ def check_ph_calendar(target_date):
         )
 
     # --------------------------------------------------------
-    # EXPLICIT RECURRING PHILIPPINE SPECIAL DAYS
+    # RECURRING PHILIPPINE SPECIAL DAYS
     #
-    # These are hard-coded intentionally so that important
-    # recurring special non-working days don't depend entirely
-    # on the holidays package.
+    # Explicitly included so important recurring special
+    # non-working days don't depend entirely on the package.
     # --------------------------------------------------------
 
     recurring_special_days = {
@@ -939,7 +962,14 @@ def send_to_google_chat(message):
 # ============================================================
 
 def check_once():
-    today = datetime.date.today()
+
+    # IMPORTANT:
+    # Do NOT use datetime.date.today() here.
+    #
+    # GitHub Actions runners may use UTC.
+    # The bot needs Philippine local time.
+
+    today = get_ph_date()
 
     print(
         "=========================================="
@@ -950,7 +980,13 @@ def check_once():
     )
 
     print(
-        f"Today's date: {format_date(today)}"
+        f"Today's Philippine date: "
+        f"{format_date(today)}"
+    )
+
+    print(
+        f"Philippine timezone: "
+        f"{PH_TIMEZONE}"
     )
 
     print(
@@ -987,12 +1023,10 @@ def check_once():
     # WEEKEND / PHILIPPINE HOLIDAY OVERRIDE
     # --------------------------------------------------------
     #
-    # THIS IS THE HIGHEST PRIORITY.
+    # HIGHEST PRIORITY.
     #
-    # Saturday/Sunday/holiday:
-    #     ❌ No School
-    #
-    # No other source is allowed to override this.
+    # If today is a weekend or Philippine holiday,
+    # nothing else can override it.
     # --------------------------------------------------------
 
     if calendar_no_classes:
@@ -1219,10 +1253,12 @@ def check_once():
 # ============================================================
 
 if __name__ == "__main__":
+
     try:
         check_once()
 
     except Exception as e:
+
         print(
             f"ERROR: {e}",
             file=sys.stderr
