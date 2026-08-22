@@ -10,10 +10,6 @@ import holidays
 from bs4 import BeautifulSoup
 
 
-# ============================================================
-# CONFIG
-# ============================================================
-
 ADVISORIES_URL = "https://www.ateneo.edu/advisories"
 FACEBOOK_URL = "https://www.facebook.com/ateneodemanila/"
 
@@ -27,14 +23,9 @@ UA = (
 
 FACEBOOK_LOOKBACK_DAYS = 14
 
-# IMPORTANT:
-# Always use Philippine time, even when running in GitHub Actions.
 PH_TIMEZONE = ZoneInfo("Asia/Manila")
 
 
-# ============================================================
-# TIME
-# ============================================================
 
 def get_ph_date():
     """
@@ -48,10 +39,6 @@ def get_ph_date():
         PH_TIMEZONE
     ).date()
 
-
-# ============================================================
-# GENERIC HELPERS
-# ============================================================
 
 def fetch(url, timeout=30, headers=None):
     r = requests.get(
@@ -134,20 +121,6 @@ def parse_date_from_text(text):
 # ============================================================
 
 def check_ph_calendar(target_date):
-    """
-    Returns:
-        (True, reason)  -> No classes
-        (False, None)   -> Normal school day
-
-    Priority:
-        1. Weekend
-        2. Explicit recurring Philippine special days
-        3. holidays package
-    """
-
-    # --------------------------------------------------------
-    # WEEKENDS
-    # --------------------------------------------------------
 
     if target_date.weekday() >= 5:
         return (
@@ -155,12 +128,6 @@ def check_ph_calendar(target_date):
             "Weekend"
         )
 
-    # --------------------------------------------------------
-    # RECURRING PHILIPPINE SPECIAL DAYS
-    #
-    # Explicitly included so important recurring special
-    # non-working days don't depend entirely on the package.
-    # --------------------------------------------------------
 
     recurring_special_days = {
         (8, 21): "Ninoy Aquino Day",
@@ -182,9 +149,8 @@ def check_ph_calendar(target_date):
             + recurring_special_days[key]
         )
 
-    # --------------------------------------------------------
-    # HOLIDAYS PACKAGE
-    # --------------------------------------------------------
+
+
 
     ph_holidays = holidays.country_holidays(
         "PH",
@@ -206,10 +172,6 @@ def check_ph_calendar(target_date):
         None
     )
 
-
-# ============================================================
-# ATENEO
-# ============================================================
 
 def fetch_advisories():
     r = fetch(ADVISORIES_URL)
@@ -337,14 +299,10 @@ def get_school_section(text, school):
     return text[start:end].strip()
 
 
-# ============================================================
-# ATENEO CLASSIFIER
-# ============================================================
-
 def classify(text):
     text = text.lower()
 
-    # Ignore conditional suspension wording.
+    # hai casitel :3
     text = re.sub(
         r"if .*?(?:declares?|declare).*?"
         r"(?:class suspension|suspension).*?(?:\.|$)",
@@ -479,9 +437,7 @@ def get_statuses(article):
     return statuses
 
 
-# ============================================================
-# QC GOVERNMENT
-# ============================================================
+# mayor joy my GOATINATOR
 
 def check_qc_government_feed(target_date):
     rss_url = "https://quezoncity.gov.ph/feed/"
@@ -550,7 +506,7 @@ def check_qc_government_feed(target_date):
             f"{title}".strip()
         )
 
-    # ---------------- RSS ----------------
+    # rss
 
     try:
         r = fetch(
@@ -591,7 +547,7 @@ def check_qc_government_feed(target_date):
             file=sys.stderr
         )
 
-    # ---------------- FALLBACK ----------------
+    # make sure
 
     try:
         r = fetch(
@@ -636,9 +592,7 @@ def check_qc_government_feed(target_date):
     )
 
 
-# ============================================================
-# PAGASA
-# ============================================================
+# orange/red please i beg u
 
 def check_pagasa_bulletin(target_date):
     url = (
@@ -710,9 +664,6 @@ def check_pagasa_bulletin(target_date):
     )
 
 
-# ============================================================
-# FACEBOOK
-# ============================================================
 
 def check_facebook(target_date):
     cutoff = (
@@ -850,9 +801,6 @@ def check_facebook(target_date):
     return None
 
 
-# ============================================================
-# STATUS ICONS
-# ============================================================
 
 def status_icon(status):
     return {
@@ -869,10 +817,6 @@ def status_icon(status):
         "🟡"
     )
 
-
-# ============================================================
-# GOOGLE CHAT MESSAGE
-# ============================================================
 
 def create_message(
     date,
@@ -938,9 +882,7 @@ def create_message(
     return "\n".join(lines)
 
 
-# ============================================================
-# GOOGLE CHAT
-# ============================================================
+
 
 def send_to_google_chat(message):
     if not WEBHOOK_URL:
@@ -957,17 +899,10 @@ def send_to_google_chat(message):
     r.raise_for_status()
 
 
-# ============================================================
-# MAIN
-# ============================================================
 
 def check_once():
 
-    # IMPORTANT:
-    # Do NOT use datetime.date.today() here.
-    #
-    # GitHub Actions runners may use UTC.
-    # The bot needs Philippine local time.
+
 
     today = get_ph_date()
 
@@ -1002,9 +937,6 @@ def check_once():
         "=========================================="
     )
 
-    # --------------------------------------------------------
-    # PHILIPPINE CALENDAR
-    # --------------------------------------------------------
 
     calendar_no_classes, calendar_reason = (
         check_ph_calendar(today)
@@ -1019,15 +951,7 @@ def check_once():
         )
     )
 
-    # --------------------------------------------------------
-    # WEEKEND / PHILIPPINE HOLIDAY OVERRIDE
-    # --------------------------------------------------------
-    #
-    # HIGHEST PRIORITY.
-    #
-    # If today is a weekend or Philippine holiday,
-    # nothing else can override it.
-    # --------------------------------------------------------
+
 
     if calendar_no_classes:
 
@@ -1062,9 +986,6 @@ def check_once():
 
         return
 
-    # --------------------------------------------------------
-    # ATENEO
-    # --------------------------------------------------------
 
     article = fetch_advisories()
 
@@ -1108,10 +1029,6 @@ def check_once():
 
         aten_status_valid = False
 
-    # --------------------------------------------------------
-    # QC
-    # --------------------------------------------------------
-
     qc_private, qc_reason = (
         check_qc_government_feed(
             today
@@ -1127,10 +1044,6 @@ def check_once():
         f"QC: {qc_reason}"
     )
 
-    # --------------------------------------------------------
-    # PAGASA
-    # --------------------------------------------------------
-
     _, pagasa_reason = (
         check_pagasa_bulletin(
             today
@@ -1141,9 +1054,6 @@ def check_once():
         f"PAGASA: {pagasa_reason}"
     )
 
-    # --------------------------------------------------------
-    # FACEBOOK
-    # --------------------------------------------------------
 
     facebook_result = check_facebook(
         today
@@ -1172,9 +1082,7 @@ def check_once():
             "suspension found."
         )
 
-    # --------------------------------------------------------
-    # PRIVATE SCHOOL OVERRIDE
-    # --------------------------------------------------------
+
 
     private_suspended = (
         qc_private
@@ -1224,9 +1132,6 @@ def check_once():
                 "Defaulting to Face-to-Face."
             )
 
-    # --------------------------------------------------------
-    # SEND EVERY RUN
-    # --------------------------------------------------------
 
     message = create_message(
         today,
@@ -1248,9 +1153,7 @@ def check_once():
     )
 
 
-# ============================================================
-# ENTRY POINT
-# ============================================================
+
 
 if __name__ == "__main__":
 
