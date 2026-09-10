@@ -1,25 +1,30 @@
 import os
 import re
-import sys
-import datetime
-from datetime import timedelta
-from urllib.parse import urljoin, urlparse
+from datetime import datetime, date, timedelta
+from urllib.parse import urlparse
+
+import feedparser
+import holidays
+import requests
+from bs4 import BeautifulSoup
 from zoneinfo import ZoneInfo
 
-import requests
-import holidays
-import feedparser
 
-from bs4 import BeautifulSoup
-
+# ============================================================
+# CONFIG
+# ============================================================
 
 ADVISORIES_URL = "https://www.ateneo.edu/advisories"
 FACEBOOK_URL = "https://www.facebook.com/ateneodemanila/"
+
 QC_FEED_URL = "https://quezoncity.gov.ph/feed/"
 QC_NEWS_URL = "https://quezoncity.gov.ph/news/"
+QC_ANNOUNCEMENTS_URL = (
+    "https://quezoncity.gov.ph/news-and-media/announcements/"
+)
+
 PAGASA_NCR_URL = (
-    "https://bagong.pagasa.dost.gov.ph/"
-    "regional-forecast/ncrprsd"
+    "https://bagong.pagasa.dost.gov.ph/regional-forecast/ncrprsd"
 )
 
 WEBHOOK_URL = os.environ.get("GOOGLE_CHAT_WEBHOOK")
@@ -30,42 +35,34 @@ QC_LOOKBACK_DAYS = 3
 
 PH_TIMEZONE = ZoneInfo("Asia/Manila")
 
-UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/151.0.0.0 Safari/537.36"
-)
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/151.0.0.0 Safari/537.36"
+    )
+}
 
-SESSION = requests.Session()
-SESSION.headers.update(
-    {
-        "User-Agent": UA,
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-)
 
-MONTH_PATTERN = (
-    r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|"
-    r"Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|"
-    r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?"
-)
+# ============================================================
+# SCHOOL NAMES
+# ============================================================
 
 SCHOOL_ALIASES = {
-    "AGS": [
+    "ags": [
         "Ateneo Grade School",
-        "Ateneo Grade School (AGS)",
+        "Ateneo de Manila Grade School",
+        "Grade School",
         "AGS",
     ],
-    "JHS": [
+    "jhs": [
         "Ateneo Junior High School",
-        "Ateneo Junior High School (AJHS)",
-        "AJHS",
+        "Junior High School",
         "JHS",
     ],
-    "SHS": [
+    "shs": [
         "Ateneo Senior High School",
-        "Ateneo Senior High School (ASHS)",
-        "ASHS",
+        "Senior High School",
         "SHS",
     ],
 }
@@ -75,16 +72,18 @@ SCHOOL_ALIASES = {
 # HTTP
 # ============================================================
 
-def fetch(url, timeout=30, **kwargs):
-    response = SESSION.get(
-        url,
-        timeout=timeout,
-        **kwargs,
-    )
-
-    response.raise_for_status()
-
-    return response
+def fetch(url, timeout=20):
+    try:
+        response = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        return response
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch {url}: {e}")
+        return None
 
 
 # ============================================================
@@ -92,115 +91,76 @@ def fetch(url, timeout=30, **kwargs):
 # ============================================================
 
 def get_ph_date():
-    return datetime.datetime.now(
-        PH_TIMEZONE
-    ).date()
+    return datetime.now(PH_TIMEZONE).date()
 
 
-def format_date(value):
-    return value.strftime("%B ") + str(value.day)
+def normalize_text(text):
+    return re.sub(r"\s+", " ", text or "").strip()
 
 
-def normalize_month(value):
-    return {
-        "jan": "Jan",
-        "january": "January",
-        "feb": "Feb",
-        "february": "February",
-        "mar": "Mar",
-        "march": "March",
-        "apr": "Apr",
-        "april": "April",
-        "may": "May",
-        "jun": "Jun",
-        "june": "June",
-        "jul": "Jul",
-        "july": "July",
-        "aug": "Aug",
-        "august": "August",
-        "sep": "Sep",
-        "sept": "Sep",
-        "september": "September",
-        "oct": "Oct",
-        "october": "October",
-        "nov": "Nov",
-        "november": "November",
-        "dec": "Dec",
-        "december": "December",
-    }.get(
-        value.lower().strip()
-    )
-
-
-def parse_single_date(day, month, year):
-    month = normalize_month(month)
-
-    if not month:
+def parse_date_string(value):
+    if not value:
         return None
 
-    for fmt in (
-        "%d %b %Y",
-        "%d %B %Y",
-    ):
-        try:
-            return datetime.datetime.strptime(
-                f"{day} {month} {year}",
-                fmt,
-            ).date()
+    value = normalize_text(value)
 
+    formats = [
+        "%B %d, %Y",
+        "%b %d, %Y",
+        "%B %d %Y",
+        "%b %d %Y",
+        "%Y-%m-%d",
+        "%m/%d/%Y",
+        "%m-%d-%Y",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+    ]
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(value, fmt).date()
         except ValueError:
             pass
 
     return None
 
 
-def parse_date_from_text(text):
-    patterns = (
-        rf"\b({MONTH_PATTERN})\s+"
-        rf"(\d{{1,2}}),?\s+(\d{{4}})\b",
+def extract_dates(text):
+    """
+    Extract common English date formats from arbitrary text.
+    """
+    if not text:
+        return []
 
-        rf"\b(\d{{1,2}})\s+"
-        rf"({MONTH_PATTERN})\s+(\d{{4}})\b",
-    )
+    patterns = [
+        r"\b(?:January|February|March|April|May|June|July|August|"
+        r"September|October|November|December)\s+\d{1,2},\s+\d{4}\b",
 
-    dates = []
+        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)"
+        r"\.?\s+\d{1,2},\s+\d{4}\b",
 
-    for index, pattern in enumerate(patterns):
-        for match in re.finditer(
-            pattern,
-            text,
-            re.I,
-        ):
-            a, b, c = match.groups()
+        r"\b\d{4}-\d{2}-\d{2}\b",
 
-            if index == 0:
-                value = parse_single_date(
-                    b,
-                    a,
-                    c,
-                )
-            else:
-                value = parse_single_date(
-                    a,
-                    b,
-                    c,
-                )
+        r"\b\d{1,2}/\d{1,2}/\d{4}\b",
+    ]
 
-            if value:
-                dates.append(value)
+    found = []
 
-    return dates
+    for pattern in patterns:
+        for match in re.findall(pattern, text, flags=re.I):
+            parsed = parse_date_string(match)
+            if parsed:
+                found.append(parsed)
+
+    return found
 
 
-def dates_in_window(
-    text,
-    start_date,
-    end_date,
-):
+def dates_in_window(text, target_date, days=1):
+    dates = extract_dates(text)
+
     return [
-        value
-        for value in parse_date_from_text(text)
-        if start_date <= value <= end_date
+        d for d in dates
+        if abs((d - target_date).days) <= days
     ]
 
 
@@ -208,535 +168,279 @@ def dates_in_window(
 # PHILIPPINE CALENDAR
 # ============================================================
 
-def check_ph_calendar(value):
-    if value.weekday() >= 5:
+def check_ph_calendar(target_date):
+    if target_date.weekday() >= 5:
         return True, "Weekend"
 
-    fixed_special_days = {
+    fixed_holidays = {
+        (1, 1): "New Year's Day",
+        (4, 9): "Araw ng Kagitingan",
+        (5, 1): "Labor Day",
+        (6, 12): "Independence Day",
         (8, 21): "Ninoy Aquino Day",
+        (8, 31): "National Heroes Day",
         (11, 1): "All Saints' Day",
-        (12, 8): (
-            "Feast of the Immaculate Conception"
-        ),
+        (11, 2): "All Souls' Day",
+        (11, 30): "Bonifacio Day",
+        (12, 8): "Feast of the Immaculate Conception",
         (12, 24): "Christmas Eve",
+        (12, 25): "Christmas Day",
+        (12, 30): "Rizal Day",
         (12, 31): "Last Day of the Year",
     }
 
-    if (
-        value.month,
-        value.day,
-    ) in fixed_special_days:
-        return (
-            True,
-            "Philippine special non-working day: "
-            + fixed_special_days[
-                (
-                    value.month,
-                    value.day,
-                )
-            ],
+    if (target_date.month, target_date.day) in fixed_holidays:
+        return True, fixed_holidays[
+            (target_date.month, target_date.day)
+        ]
+
+    try:
+        ph_holidays = holidays.country_holidays(
+            "PH",
+            years=[target_date.year],
         )
 
-    holidays_for_year = holidays.country_holidays(
-        "PH",
-        years=value.year,
-    )
+        if target_date in ph_holidays:
+            return True, ph_holidays.get(target_date)
 
-    if value in holidays_for_year:
-        return (
-            True,
-            f"Philippine holiday: "
-            f"{holidays_for_year.get(value)}",
-        )
+    except Exception as e:
+        print(f"[CALENDAR] Holiday lookup failed: {e}")
 
     return False, None
 
 
 # ============================================================
-# GENERIC HTML
-# ============================================================
-
-def get_page_text(soup):
-    for element in soup(
-        [
-            "script",
-            "style",
-            "noscript",
-            "svg",
-        ]
-    ):
-        element.decompose()
-
-    return soup.get_text(
-        "\n",
-        strip=True,
-    )
-
-
-# ============================================================
-# ATENEO
-# ============================================================
-
-def fetch_advisories():
-    return BeautifulSoup(
-        fetch(
-            ADVISORIES_URL
-        ).text,
-        "html.parser",
-    )
-
-
-def find_class_arrangements_date(soup):
-    text = get_page_text(soup)
-
-    # Try to specifically associate
-    # Class Arrangements with Last Updated.
-    match = re.search(
-        r"Class Arrangements.{0,1500}?"
-        r"Last Updated on.{0,150}?"
-        rf"(\d{{1,2}})\s+"
-        rf"({MONTH_PATTERN})\s+"
-        rf"(\d{{4}})",
-        text,
-        re.I | re.S,
-    )
-
-    if match:
-        value = parse_single_date(
-            *match.groups()
-        )
-
-        if value:
-            return value
-
-    # Fallback to newest Last Updated date.
-    values = [
-        parse_single_date(*groups)
-        for groups in re.findall(
-            r"Last Updated on.{0,150}?"
-            rf"(\d{{1,2}})\s+"
-            rf"({MONTH_PATTERN})\s+"
-            rf"(\d{{4}})",
-            text,
-            re.I | re.S,
-        )
-    ]
-
-    values = [
-        value
-        for value in values
-        if value
-    ]
-
-    if values:
-        print(
-            "[WARNING] Could not specifically identify "
-            "Class Arrangements update date."
-        )
-
-        print(
-            "[WARNING] Using newest "
-            "'Last Updated' date."
-        )
-
-        return max(values)
-
-    raise RuntimeError(
-        "Could not find an Ateneo "
-        "Class Arrangements update date."
-    )
-
-
-def is_recent_advisory_date(
-    advisory_date,
-    today,
-):
-    minimum = (
-        today
-        - timedelta(
-            days=ADVISORY_LOOKBACK_DAYS
-        )
-    )
-
-    return (
-        minimum
-        <= advisory_date
-        <= today
-    )
-
-
-def find_school_position(
-    text,
-    school,
-):
-    positions = []
-
-    for alias in SCHOOL_ALIASES[school]:
-        match = re.search(
-            rf"\b{re.escape(alias)}\b",
-            text,
-            re.I,
-        )
-
-        if match:
-            positions.append(
-                (
-                    match.start(),
-                    match.end(),
-                    alias,
-                )
-            )
-
-    return (
-        min(
-            positions,
-            key=lambda item: item[0],
-        )
-        if positions
-        else None
-    )
-
-
-def get_school_section(
-    text,
-    school,
-):
-    position = find_school_position(
-        text,
-        school,
-    )
-
-    if not position:
-        print(
-            f"[WARNING] Could not find "
-            f"{school} section."
-        )
-
-        return ""
-
-    start, end, alias = position
-
-    boundaries = []
-
-    for other_school in SCHOOL_ALIASES:
-        if other_school == school:
-            continue
-
-        other_position = find_school_position(
-            text[end:],
-            other_school,
-        )
-
-        if other_position:
-            boundaries.append(
-                end + other_position[0]
-            )
-
-    for boundary in (
-        "University Operations",
-        "Higher Education",
-    ):
-        match = re.search(
-            re.escape(boundary),
-            text[end:],
-            re.I,
-        )
-
-        if match:
-            boundaries.append(
-                end + match.start()
-            )
-
-    section_end = min(
-        boundaries or [len(text)]
-    )
-
-    section = text[
-        start:section_end
-    ].strip()
-
-    print(
-        f"[DEBUG] {school} matched alias: "
-        f"{alias}"
-    )
-
-    return section
-
-
-# ============================================================
-# ATENEO STATUS CLASSIFICATION
+# ATENEO ADVISORY CLASSIFICATION
 # ============================================================
 
 def classify(text):
-    if not text:
-        return "Unknown"
+    text = normalize_text(text).lower()
 
-    text = text.lower()
-
-    asynchronous_patterns = (
-        r"\basynchronous online\b",
-        r"\bonline asynchronous\b",
-        r"\basynchronous modality\b",
-        r"\basynchronous classes?\b",
-        r"\basynchronous period\b",
-        r"\basynchronous instruction\b",
-        r"\basynchronous learning\b",
-        r"\basynchronous activities\b",
-        r"\bshift(?:ing)? to asynchronous\b",
-        r"\basync(?:hronous)? online\b",
-    )
-
-    synchronous_patterns = (
-        r"\bsynchronous online\b",
-        r"\bonline synchronous\b",
-        r"\bsynchronous classes?\b",
-        r"\bsynchronous session\b",
-        r"\bsynchronous instruction\b",
-        r"\bsynchronous modality\b",
-        r"\bsynchronous learning\b",
-        r"\bshift(?:ing)? to synchronous\b",
-        r"\bsync(?:hronous)? online\b",
-    )
-
-    async_hits = [
-        match
-        for pattern in asynchronous_patterns
-        if (
-            match := re.search(
-                pattern,
-                text,
-            )
-        )
-    ]
-
-    sync_hits = [
-        match
-        for pattern in synchronous_patterns
-        if (
-            match := re.search(
-                pattern,
-                text,
-            )
-        )
-    ]
-
-    if async_hits and sync_hits:
-        first_async = min(
-            async_hits,
-            key=lambda match: match.start(),
-        )
-
-        first_sync = min(
-            sync_hits,
-            key=lambda match: match.start(),
-        )
-
-        return (
-            "Asynchronous Online"
-            if first_async.start()
-            < first_sync.start()
-            else "Synchronous Online"
-        )
-
-    if async_hits:
-        return "Asynchronous Online"
-
-    if sync_hits:
+    # Most specific first.
+    if any(
+        phrase in text
+        for phrase in [
+            "synchronous online",
+            "synchronous learning",
+            "synchronous classes",
+            "synchronous modality",
+            "live online classes",
+        ]
+    ):
         return "Synchronous Online"
 
-    online_patterns = (
-        r"\bonline classes\b",
-        r"\bonline class\b",
-        r"\bonline modality\b",
-        r"\bonline instruction\b",
-        r"\bvirtual classes\b",
-        r"\bvirtual instruction\b",
-        r"\bremote learning\b",
-        r"\bremote classes\b",
-        r"\bclasses will be conducted online\b",
-        r"\bclasses remain online\b",
-        r"\bshifting to online\b",
-        r"\bshift to online\b",
-    )
-
     if any(
-        re.search(
-            pattern,
-            text,
-        )
-        for pattern in online_patterns
+        phrase in text
+        for phrase in [
+            "asynchronous online",
+            "asynchronous learning",
+            "asynchronous classes",
+            "asynchronous modality",
+        ]
     ):
-        return "Online"
-
-    suspension_patterns = (
-        r"\bclasses are suspended\b",
-        r"\bclasses have been suspended\b",
-        r"\bclasses remain suspended\b",
-        r"\bclass suspension is in effect\b",
-        r"\ball classes are suspended\b",
-        r"\bclasses are cancelled\b",
-        r"\bclasses are canceled\b",
-        r"\bno classes will be held\b",
-        r"\bno classes today\b",
-        r"\bwalang pasok\b",
-    )
+        return "Asynchronous Online"
 
     if any(
-        re.search(
-            pattern,
-            text,
-        )
-        for pattern in suspension_patterns
+        phrase in text
+        for phrase in [
+            "alternative delivery mode",
+            "alternative delivery modes",
+            "alternative delivery",
+        ]
     ):
-        return "Suspension"
+        if "synchronous" in text:
+            return "Synchronous Online"
 
-    onsite_patterns = (
-        r"\bonsite classes\b",
-        r"\bon-site classes\b",
-        r"\bface-to-face classes\b",
-        r"\bface to face classes\b",
-        r"\bf2f classes\b",
-        r"\bonsite instruction\b",
-        r"\bclasses.*resume.*onsite\b",
-        r"\bresume.*onsite classes\b",
-    )
+        if "asynchronous" in text:
+            return "Asynchronous Online"
 
     if any(
-        re.search(
-            pattern,
-            text,
-        )
-        for pattern in onsite_patterns
+        phrase in text
+        for phrase in [
+            "online modality",
+            "online classes",
+            "online learning",
+            "classes will be held online",
+            "learning will be conducted online",
+        ]
+    ):
+        return "Synchronous Online"
+
+    if any(
+        phrase in text
+        for phrase in [
+            "classes are suspended",
+            "classes will be suspended",
+            "suspension of classes",
+            "class suspension",
+            "no classes",
+            "classes cancelled",
+            "classes canceled",
+        ]
+    ):
+        return "No School"
+
+    if any(
+        phrase in text
+        for phrase in [
+            "face-to-face classes",
+            "face to face classes",
+            "onsite classes",
+            "on-site classes",
+            "classes will proceed as usual",
+            "regular classes",
+        ]
     ):
         return "Onsite"
 
-    return "Unknown"
+    return None
 
+
+# ============================================================
+# ATENEO SCHOOL STATUS
+# ============================================================
 
 def get_statuses(soup):
-    text = get_page_text(soup)
+    """
+    Extract AGS/JHS/SHS statuses from the advisory page.
+    """
 
-    statuses = {}
+    text = soup.get_text(" ", strip=True)
 
-    for school in (
-        "AGS",
-        "JHS",
-        "SHS",
-    ):
-        section = get_school_section(
-            text,
-            school,
-        )
+    statuses = {
+        "ags": "Unknown",
+        "jhs": "Unknown",
+        "shs": "Unknown",
+    }
 
-        statuses[school] = classify(
-            section
-        )
+    # Try to classify school-specific sections first.
+    for school, aliases in SCHOOL_ALIASES.items():
+        for alias in aliases:
+            matches = soup.find_all(
+                string=lambda s: s and alias.lower() in s.lower()
+            )
 
-        print(
-            f"[DEBUG] {school}: "
-            f"{statuses[school]}"
-        )
+            for match in matches:
+                parent = match.parent
 
-        print(
-            f"[DEBUG] {school} section:"
-        )
+                # Search a reasonably sized surrounding area.
+                chunks = [
+                    parent.get_text(" ", strip=True)
+                    if parent else "",
+                ]
 
-        print(
-            section[:500]
-        )
+                if parent and parent.parent:
+                    chunks.append(
+                        parent.parent.get_text(" ", strip=True)
+                    )
 
-        print("-" * 40)
+                combined = " ".join(chunks)
+                status = classify(combined)
+
+                if status:
+                    statuses[school] = status
+                    break
+
+            if statuses[school] != "Unknown":
+                break
+
+    # If school-specific extraction failed, inspect the entire advisory.
+    overall = classify(text)
+
+    if overall:
+        for school in statuses:
+            if statuses[school] == "Unknown":
+                statuses[school] = overall
 
     return statuses
 
 
-def advisory_has_school_arrangements(
-    soup,
-):
-    text = get_page_text(
-        soup
-    ).lower()
+# ============================================================
+# FIND RECENT ATENEO ADVISORY
+# ============================================================
 
-    keywords = (
+def get_recent_ateneo_advisory(today):
+    """
+    The advisory does NOT have to be dated today.
+
+    If an advisory containing class-arrangement information was
+    published within the previous week, use it.
+    """
+
+    response = fetch(ADVISORIES_URL)
+
+    if not response:
+        return None, None, ""
+
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    page_text = normalize_text(
+        soup.get_text(" ", strip=True)
+    )
+
+    # Look for date information anywhere on the page.
+    dates = extract_dates(page_text)
+
+    recent_dates = [
+        d for d in dates
+        if today - timedelta(days=ADVISORY_LOOKBACK_DAYS)
+        <= d
+        <= today
+    ]
+
+    # Look for class arrangement terminology.
+    arrangement_keywords = [
+        "class arrangement",
         "class arrangements",
-        "classes",
-        "onsite",
-        "on-site",
-        "face-to-face",
         "synchronous",
         "asynchronous",
-        "online",
-        "suspended",
-        "no classes",
+        "online modality",
+        "alternative delivery",
+        "face-to-face",
+        "face to face",
+        "classes are suspended",
+        "suspension of classes",
+        "classes will proceed",
+    ]
+
+    has_arrangement = any(
+        keyword in page_text.lower()
+        for keyword in arrangement_keywords
     )
 
-    return any(
-        keyword in text
-        for keyword in keywords
-    )
+    if not has_arrangement:
+        print("[ATENEO] No class-arrangement information found.")
+        return None, None, ""
 
+    advisory_date = max(recent_dates) if recent_dates else None
 
-def get_recent_ateneo_advisory(
-    today,
-):
-    soup = fetch_advisories()
-
-    advisory_date = (
-        find_class_arrangements_date(
-            soup
-        )
-    )
-
-    print(
-        "[DEBUG] Ateneo advisory date: "
-        f"{advisory_date}"
-    )
-
-    if not is_recent_advisory_date(
-        advisory_date,
-        today,
-    ):
+    if advisory_date:
+        age = (today - advisory_date).days
         print(
-            "[DEBUG] Ateneo advisory is older "
-            f"than {ADVISORY_LOOKBACK_DAYS} days."
+            f"[ATENEO] Found recent advisory date: "
+            f"{advisory_date} ({age} day(s) old)"
         )
-
-        return None, advisory_date
-
-    if not advisory_has_school_arrangements(
-        soup
-    ):
+    else:
         print(
-            "[WARNING] Ateneo advisory does not "
-            "appear to contain class-arrangement "
-            "information."
+            "[ATENEO] Class-arrangement information found, "
+            "but no usable date was detected."
         )
 
-        return None, advisory_date
-
-    return soup, advisory_date
+    return soup, advisory_date, page_text
 
 
 # ============================================================
 # QC FEED DISCOVERY
 # ============================================================
 
-def same_official_domain(url):
+def is_qc_url(url):
     try:
-        hostname = urlparse(
-            url
-        ).hostname
-
-        if not hostname:
-            return False
-
+        hostname = urlparse(url).hostname or ""
         hostname = hostname.lower()
 
         return (
             hostname == "quezoncity.gov.ph"
-            or hostname.endswith(
-                ".quezoncity.gov.ph"
-            )
+            or hostname.endswith(".quezoncity.gov.ph")
         )
 
     except Exception:
@@ -747,449 +451,335 @@ def discover_qc_feed_urls():
     """
     Discover RSS/Atom feeds from official QC pages.
 
-    The known feed URL is retained as a fallback,
-    but actual entries are still followed and verified.
+    The feed itself is NOT treated as the announcement.
+    We follow the individual entry URL and inspect that page.
     """
 
-    candidates = set()
-
-    starting_urls = (
+    candidates = {
         QC_FEED_URL,
         QC_NEWS_URL,
-        "https://quezoncity.gov.ph/",
-    )
+        QC_ANNOUNCEMENTS_URL,
+    }
 
-    for starting_url in starting_urls:
-        try:
-            soup = BeautifulSoup(
-                fetch(
-                    starting_url,
-                    timeout=15,
-                ).text,
-                "html.parser",
-            )
+    discovered = set()
 
-            for link in soup.find_all(
-                "link",
-                href=True,
+    for url in candidates:
+        response = fetch(url)
+
+        if not response:
+            continue
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # RSS/Atom <link> tags.
+        for link in soup.find_all("link"):
+            href = link.get("href")
+
+            if not href:
+                continue
+
+            link_type = (
+                link.get("type", "")
+                or ""
+            ).lower()
+
+            href_lower = href.lower()
+
+            if (
+                "rss" in link_type
+                or "atom" in link_type
+                or "feed" in href_lower
+                or "rss" in href_lower
             ):
-                rel = " ".join(
-                    link.get(
-                        "rel",
-                        [],
-                    )
-                ).lower()
+                if is_qc_url(href):
+                    discovered.add(href)
 
-                link_type = (
-                    link.get(
-                        "type",
-                        "",
-                    ).lower()
-                )
+        # Also inspect normal links.
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
 
-                href = urljoin(
-                    starting_url,
-                    link["href"],
-                )
+            href_lower = href.lower()
 
-                if (
-                    "alternate" in rel
-                    and (
-                        "rss" in link_type
-                        or "atom" in link_type
-                        or "feed" in href.lower()
-                        or "rss" in href.lower()
-                    )
-                    and same_official_domain(
-                        href
-                    )
-                ):
-                    candidates.add(
-                        href
-                    )
-
-            for anchor in soup.find_all(
-                "a",
-                href=True,
+            if (
+                "feed" in href_lower
+                or "rss" in href_lower
+                or "atom" in href_lower
             ):
-                anchor_text = anchor.get_text(
-                    " ",
-                    strip=True,
-                ).lower()
+                if is_qc_url(href):
+                    discovered.add(href)
 
-                href = urljoin(
-                    starting_url,
-                    anchor["href"],
-                )
+    # Known official feed as fallback.
+    discovered.add(QC_FEED_URL)
 
-                if (
-                    same_official_domain(
-                        href
-                    )
-                    and (
-                        "rss" in anchor_text
-                        or "feed" in anchor_text
-                        or "atom" in anchor_text
-                        or "rss" in href.lower()
-                        or "feed" in href.lower()
-                    )
-                ):
-                    candidates.add(
-                        href
-                    )
+    print("[QC] Feed candidates:")
 
-        except Exception as error:
-            print(
-                "[WARNING] Could not inspect "
-                f"QC source {starting_url}: "
-                f"{error}",
-                file=sys.stderr,
-            )
+    for url in sorted(discovered):
+        print(f"  - {url}")
 
-    candidates.add(
-        QC_FEED_URL
-    )
-
-    print(
-        "[DEBUG] Discovered QC feed URLs:"
-    )
-
-    for url in sorted(candidates):
-        print(
-            f"  {url}"
-        )
-
-    return sorted(
-        candidates
-    )
+    return list(discovered)
 
 
 # ============================================================
-# QC ANNOUNCEMENTS
+# QC ANNOUNCEMENT ANALYSIS
 # ============================================================
 
-def looks_like_qc_class_announcement(
-    title,
-    text,
-):
-    combined = (
-        title
-        + " "
-        + text
-    ).lower()
+def analyze_qc_announcement(url, target_date):
+    """
+    Fetch the actual QC announcement page and determine what it says.
+    """
 
-    return (
-        (
-            "walang pasok" in combined
-            or "class suspension" in combined
-            or "classes suspended" in combined
-            or "face-to-face classes" in combined
-            or "alternative delivery" in combined
-        )
-        and (
-            "school" in combined
-            or "classes" in combined
-            or "paaralan" in combined
-        )
+    if not is_qc_url(url):
+        return None
+
+    response = fetch(url)
+
+    if not response:
+        return None
+
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    text = normalize_text(
+        soup.get_text(" ", strip=True)
     )
 
+    lower = text.lower()
 
-def analyze_qc_announcement(
-    url,
-    target_date,
-):
-    """
-    Follow the actual official QC announcement.
+    # Ignore ancient announcements.
+    relevant_dates = dates_in_window(
+        text,
+        target_date,
+        days=QC_LOOKBACK_DAYS,
+    )
 
-    The RSS entry itself is NOT considered authoritative.
-    """
+    if not relevant_dates:
+        return None
 
-    if not same_official_domain(
-        url
+    private_school = any(
+        phrase in lower
+        for phrase in [
+            "private schools",
+            "private school",
+            "private educational institutions",
+            "pribadong paaralan",
+        ]
+    )
+
+    suspended = any(
+        phrase in lower
+        for phrase in [
+            "suspension of classes",
+            "classes suspended",
+            "classes are suspended",
+            "face-to-face classes suspended",
+            "suspend face-to-face",
+            "suspended face-to-face",
+            "walang pasok",
+            "suspension ng klase",
+        ]
+    )
+
+    alternative_delivery = any(
+        phrase in lower
+        for phrase in [
+            "alternative delivery modes",
+            "alternative delivery mode",
+            "alternative delivery",
+            "synchronous / asynchronous",
+            "synchronous/asynchronous",
+            "synchronous and asynchronous",
+            "synchronous or asynchronous",
+        ]
+    )
+
+    # A more explicit check for modality language.
+    if (
+        "synchronous" in lower
+        and "asynchronous" in lower
     ):
-        print(
-            "[DEBUG] Ignoring non-QC URL: "
-            f"{url}"
+        alternative_delivery = True
+
+    title = ""
+
+    # Try to get the page title / H1.
+    h1 = soup.find("h1")
+
+    if h1:
+        title = normalize_text(
+            h1.get_text(" ", strip=True)
         )
 
-        return None
+    if not title:
+        title_tag = soup.find("title")
 
-    try:
-        response = fetch(
-            url,
-            timeout=15,
-        )
-
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser",
-        )
-
-        text = get_page_text(
-            soup
-        )
-
-        title = (
-            soup.title.get_text(
-                " ",
-                strip=True,
+        if title_tag:
+            title = normalize_text(
+                title_tag.get_text(" ", strip=True)
             )
-            if soup.title
-            else ""
-        )
 
-        combined = (
-            title
-            + "\n"
-            + text
-        ).lower()
+    newest_date = max(relevant_dates)
 
-        announcement_dates = dates_in_window(
-            combined,
-            target_date
-            - timedelta(
-                days=QC_LOOKBACK_DAYS
-            ),
-            target_date
-            + timedelta(days=1),
-        )
-
-        if not announcement_dates:
-            return None
-
-        private_school = any(
-            phrase in combined
-            for phrase in (
-                "private schools",
-                "private school",
-                "pribadong paaralan",
-                "pribadong school",
-                "public and private schools",
-                "pampubliko at pribadong paaralan",
-            )
-        )
-
-        suspended = any(
-            phrase in combined
-            for phrase in (
-                "suspended",
-                "suspension",
-                "suspendido",
-                "walang pasok",
-                "no classes",
-                "classes suspended",
-            )
-        )
-
-        alternative_delivery = any(
-            phrase in combined
-            for phrase in (
-                "alternative delivery modes",
-                "alternative delivery mode",
-                "alternative delivery",
-                "synchronous / asynchronous",
-                "synchronous/asynchronous",
-                "synchronous or asynchronous",
-                "asynchronous / synchronous",
-            )
-        )
-
-        if not looks_like_qc_class_announcement(
-            title,
-            text,
-        ):
-            return None
-
-        return {
-            "url": url,
-            "title": title,
-            "date": max(
-                announcement_dates
-            ),
-            "private_school": private_school,
-            "suspended": suspended,
-            "alternative_delivery": (
-                alternative_delivery
-            ),
-            "text": text,
-        }
-
-    except Exception as error:
-        print(
-            "[WARNING] QC announcement check "
-            f"failed for {url}: {error}",
-            file=sys.stderr,
-        )
-
-        return None
+    return {
+        "url": url,
+        "title": title,
+        "date": newest_date,
+        "private_school": private_school,
+        "suspended": suspended,
+        "alternative_delivery": alternative_delivery,
+        "text": text,
+    }
 
 
-def check_qc_government_feed(
-    target_date,
-):
-    """
-    Discover QC's feed, inspect its entries,
-    then follow each relevant official announcement.
+# ============================================================
+# QC GOVERNMENT FEED
+# ============================================================
 
-    The actual announcement body is what determines
-    private-school suspension and alternative delivery.
-    """
+def check_qc_government_feed(target_date=None):
+    if target_date is None:
+        target_date = get_ph_date()
 
-    feed_urls = (
-        discover_qc_feed_urls()
-    )
+    feed_urls = discover_qc_feed_urls()
 
     announcements = []
 
     for feed_url in feed_urls:
-        try:
-            response = fetch(
-                feed_url,
-                timeout=15,
+        print(f"[QC] Reading feed: {feed_url}")
+
+        response = fetch(feed_url)
+
+        if not response:
+            continue
+
+        parsed = feedparser.parse(response.content)
+
+        for entry in parsed.entries:
+            entry_url = (
+                entry.get("link")
+                or entry.get("id")
+                or ""
             )
 
-            parsed = feedparser.parse(
-                response.content
-            )
-
-            if not parsed.entries:
-                print(
-                    "[DEBUG] No entries in QC feed: "
-                    f"{feed_url}"
-                )
-
+            if not entry_url:
                 continue
 
-            print(
-                f"[DEBUG] Checking "
-                f"{len(parsed.entries)} "
-                f"entries from {feed_url}"
+            if not is_qc_url(entry_url):
+                continue
+
+            # Inspect the actual announcement URL.
+            result = analyze_qc_announcement(
+                entry_url,
+                target_date,
             )
 
-            for entry in parsed.entries:
-                title = entry.get(
-                    "title",
-                    "",
-                )
+            if result:
+                announcements.append(result)
 
-                summary = entry.get(
-                    "summary",
-                    "",
-                )
+    # Remove duplicate URLs.
+    unique = {}
 
-                link = entry.get(
-                    "link",
-                    "",
-                )
+    for announcement in announcements:
+        unique[announcement["url"]] = announcement
 
-                if not link:
-                    continue
+    announcements = list(unique.values())
 
-                link = urljoin(
-                    feed_url,
-                    link,
-                )
+    # --------------------------------------------------------
+    # If RSS discovery failed, inspect official announcements page
+    # links directly.
+    # --------------------------------------------------------
 
-                if not same_official_domain(
-                    link
-                ):
-                    continue
+    if not announcements:
+        print(
+            "[QC] Feed produced no usable announcements; "
+            "scanning official announcements page."
+        )
 
-                quick_text = (
-                    title
-                    + " "
-                    + summary
-                ).lower()
+        response = fetch(QC_ANNOUNCEMENTS_URL)
 
-                if not any(
-                    phrase in quick_text
-                    for phrase in (
-                        "walang pasok",
-                        "class suspension",
-                        "classes suspended",
-                        "face-to-face classes",
-                        "alternative delivery",
-                        "school",
-                    )
-                ):
+        if response:
+            soup = BeautifulSoup(
+                response.text,
+                "html.parser",
+            )
+
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+
+                if not is_qc_url(href):
                     continue
 
                 result = analyze_qc_announcement(
-                    link,
+                    href,
                     target_date,
                 )
 
                 if result:
-                    announcements.append(
-                        result
-                    )
+                    unique[result["url"]] = result
 
-        except Exception as error:
-            print(
-                "[WARNING] QC feed failed "
-                f"{feed_url}: {error}",
-                file=sys.stderr,
-            )
+            announcements = list(unique.values())
 
     if not announcements:
+        print("[QC] No relevant announcement found.")
+
         return {
             "private_suspended": False,
             "alternative_delivery": False,
-            "reason": (
-                "No recent matching "
-                "QC announcement."
-            ),
-            "announcement": None,
+            "reason": None,
+            "title": None,
+            "date": None,
+            "url": None,
         }
 
+    # Newest relevant announcement wins.
     announcements.sort(
-        key=lambda item: item["date"],
+        key=lambda x: x["date"],
         reverse=True,
     )
 
     newest = announcements[0]
 
-    print(
-        "[DEBUG] Newest QC announcement:"
+    private_suspended = (
+        newest["private_school"]
+        and newest["suspended"]
     )
 
-    print(
-        f"  {newest['date']} "
-        f"{newest['title']}"
-    )
+    alternative_delivery = newest["alternative_delivery"]
 
     print(
-        f"  private="
-        f"{newest['private_school']}"
+        f"[QC] Newest announcement: "
+        f"{newest['title'] or '(untitled)'}"
     )
 
+    print(f"[QC] Date: {newest['date']}")
+    print(f"[QC] Private school: {newest['private_school']}")
+    print(f"[QC] Suspended: {newest['suspended']}")
     print(
-        f"  suspended="
-        f"{newest['suspended']}"
-    )
-
-    print(
-        "  alternative_delivery="
+        f"[QC] Alternative delivery: "
         f"{newest['alternative_delivery']}"
     )
-
-    print(
-        f"  URL={newest['url']}"
-    )
+    print(f"[QC] URL: {newest['url']}")
 
     return {
-        "private_suspended": (
-            newest["private_school"]
-            and newest["suspended"]
-        ),
-        "alternative_delivery": (
-            newest["alternative_delivery"]
-        ),
+        "private_suspended": private_suspended,
+        "alternative_delivery": alternative_delivery,
         "reason": (
-            "QC private-school suspension: "
-            + newest["title"]
+            "Private-school suspension + "
+            "Alternative Delivery Modes"
+            if (
+                private_suspended
+                and alternative_delivery
+            )
+            else (
+                "Private-school suspension"
+                if private_suspended
+                else (
+                    "Alternative Delivery Modes"
+                    if alternative_delivery
+                    else None
+                )
+            )
         ),
-        "announcement": newest,
+        "title": newest["title"],
+        "date": newest["date"],
+        "url": newest["url"],
     }
 
 
@@ -1197,702 +787,594 @@ def check_qc_government_feed(
 # PAGASA
 # ============================================================
 
-def check_pagasa_bulletin(
-    target_date,
-):
-    """
-    Check PAGASA's NCR-specific page.
+def check_pagasa_bulletin():
+    response = fetch(PAGASA_NCR_URL)
 
-    Orange/Red triggers additional scrutiny, but do NOT
-    directly override an explicit Ateneo advisory.
-    """
+    if not response:
+        return False, None
 
-    try:
-        response = fetch(
-            PAGASA_NCR_URL,
-            timeout=15,
-        )
+    soup = BeautifulSoup(
+        response.text,
+        "html.parser",
+    )
 
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser",
-        )
+    text = normalize_text(
+        soup.get_text(" ", strip=True)
+    ).lower()
 
-        text = get_page_text(
-            soup
-        )
+    # Only Orange/Red are treated as a trigger.
+    if "red warning level" in text:
+        return True, "PAGASA NCR Red Warning"
 
-        lower = text.lower()
+    if "orange warning level" in text:
+        return True, "PAGASA NCR Orange Warning"
 
-        if not any(
-            phrase in lower
-            for phrase in (
-                "heavy rainfall warning",
-                "rainfall warning",
-                "rainfall advisory",
-            )
-        ):
-            return (
-                False,
-                "No active PAGASA rainfall "
-                "warning found.",
-            )
-
-        if not any(
-            phrase in lower
-            for phrase in (
-                "metro manila",
-                "national capital region",
-                "ncr",
-            )
-        ):
-            return (
-                False,
-                "PAGASA bulletin is not for NCR.",
-            )
-
-        if "red warning level" in lower:
-            return (
-                True,
-                "PAGASA Red Heavy Rainfall "
-                "Warning for NCR.",
-            )
-
-        if "orange warning level" in lower:
-            return (
-                True,
-                "PAGASA Orange Heavy Rainfall "
-                "Warning for NCR.",
-            )
-
-        if "yellow warning level" in lower:
-            return (
-                False,
-                "PAGASA Yellow Heavy Rainfall "
-                "Warning only.",
-            )
-
-        return (
-            False,
-            "PAGASA rainfall warning found, "
-            "but no Orange/Red warning level.",
-        )
-
-    except Exception as error:
-        print(
-            f"PAGASA check failed: {error}",
-            file=sys.stderr,
-        )
-
-        return (
-            False,
-            "PAGASA check failed.",
-        )
+    return False, None
 
 
 # ============================================================
 # FACEBOOK
 # ============================================================
 
-def check_facebook(
-    target_date,
-):
-    cutoff = (
-        target_date
-        - timedelta(
-            days=FACEBOOK_LOOKBACK_DAYS
-        )
+def check_facebook_private_suspension():
+    response = fetch(FACEBOOK_URL)
+
+    if not response:
+        return False
+
+    soup = BeautifulSoup(
+        response.text,
+        "html.parser",
     )
 
-    try:
-        response = SESSION.get(
-            FACEBOOK_URL,
-            timeout=20,
-        )
+    text = normalize_text(
+        soup.get_text(" ", strip=True)
+    ).lower()
 
-        if response.status_code != 200:
-            print(
-                "Facebook returned HTTP "
-                f"{response.status_code}"
-            )
+    if not text:
+        return False
 
-            return None
-
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser",
-        )
-
-        raw = soup.get_text(
-            " ",
-            strip=True,
-        ).lower()
-
-        if (
-            "login" in raw
-            and len(raw) < 5000
-        ):
-            print(
-                "Facebook returned a login page."
-            )
-
-            return None
-
-        for tag in soup(
-            [
-                "script",
-                "style",
-                "noscript",
-            ]
-        ):
-            tag.decompose()
-
-        content = soup.get_text(
-            "\n",
-            strip=True,
-        )
-
-        lower = content.lower()
-
-        private = (
-            "private schools",
-            "private school",
-            "pribadong paaralan",
-        )
-
-        suspension = (
-            "suspended",
-            "suspension",
-            "suspendido",
-            "walang pasok",
-            "no classes",
-        )
-
-        if not any(
-            value in lower
-            for value in private
-        ):
-            return None
-
-        if not any(
-            value in lower
-            for value in suspension
-        ):
-            return None
-
-        dates = [
-            value
-            for value in parse_date_from_text(
-                content
-            )
-            if cutoff
-            <= value
-            <= target_date
-        ]
-
-        if dates:
-            return {
-                "private_suspended": True,
-                "date": max(dates),
-                "reason": (
-                    "Facebook private-school "
-                    "suspension detected."
-                ),
-            }
-
-    except Exception as error:
-        print(
-            f"Facebook check failed: {error}",
-            file=sys.stderr,
-        )
-
-    return None
-
-
-# ============================================================
-# STATUS OUTPUT
-# ============================================================
-
-def status_icon(status):
-    return {
-        "Synchronous Online": "🟢",
-        "Asynchronous Online": "🟢",
-        "Mixed Online": "🟢",
-        "Online": "🟢",
-        "Suspension": "🔴",
-        "No School": "❌",
-        "Onsite": "🔵",
-        "Unknown": "🟡",
-    }.get(
-        status,
-        "🟡",
-    )
-
-
-def create_message(
-    date,
-    statuses,
-    reason=None,
-    reason_type=None,
-):
-    next_date = (
-        date
-        + timedelta(days=1)
-    )
-
-    date1 = format_date(date)
-    date2 = format_date(next_date)
-
-    lines = [
-        "Yall heres the school status :D",
-        "",
-        f"this is for: *{date1}* and *{date2}*",
-        "",
-        f"*School* | *{date1}* | *{date2}*",
-        "--------------------------------",
+    suspension_terms = [
+        "no classes",
+        "classes suspended",
+        "class suspension",
+        "walang pasok",
+        "suspension of classes",
     ]
 
-    for school in (
-        "AGS",
-        "JHS",
-        "SHS",
-    ):
-        lines.append(
-            f"*{school}* | "
-            f"{status_icon(statuses[school])} "
-            f"{statuses[school]} | 🟡 Unknown"
-        )
+    private_terms = [
+        "private schools",
+        "private school",
+        "ateneo",
+    ]
 
-    if reason:
-        if reason_type == "calendar":
-            lines.extend(
-                [
-                    "",
-                    "🚨 *NO CLASSES.*",
-                    reason,
-                ]
-            )
-
-        else:
-            lines.extend(
-                [
-                    "",
-                    "🚨 *PRIVATE-SCHOOL SUSPENSION.*",
-                    reason,
-                ]
-            )
-
-    lines.extend(
-        [
-            "",
-            f"🔗 {ADVISORIES_URL}",
-        ]
+    has_suspension = any(
+        term in text
+        for term in suspension_terms
     )
 
-    return "\n".join(lines)
+    has_private = any(
+        term in text
+        for term in private_terms
+    )
+
+    return has_suspension and has_private
+
+
+# ============================================================
+# TOMORROW GUESSER
+# ============================================================
+
+def guess_tomorrow_status(today):
+    """
+    Guess tomorrow's status from publicly available information.
+
+    This is deliberately separate from the official status engine.
+    """
+
+    tomorrow = today + timedelta(days=1)
+
+    scores = {
+        "Synchronous Online": 0,
+        "Asynchronous Online": 0,
+        "No School": 0,
+        "Onsite": 0,
+    }
+
+    reasons = []
+
+    # --------------------------------------------------------
+    # 1. Weekend / holiday
+    # --------------------------------------------------------
+
+    is_holiday, holiday_reason = check_ph_calendar(
+        tomorrow
+    )
+
+    if is_holiday:
+        scores["No School"] += 100
+        reasons.append(
+            f"Calendar: {holiday_reason}"
+        )
+
+    # --------------------------------------------------------
+    # 2. QC
+    # --------------------------------------------------------
+
+    try:
+        qc = check_qc_government_feed(tomorrow)
+
+        if qc["private_suspended"]:
+            scores["No School"] += 25
+            reasons.append(
+                "QC indicates a private-school suspension."
+            )
+
+        if qc["alternative_delivery"]:
+            # Alternative Delivery Modes is evidence for
+            # online learning, but does not distinguish
+            # synchronous vs asynchronous by itself.
+            scores["Synchronous Online"] += 35
+            scores["Asynchronous Online"] += 30
+
+            # Important:
+            # alternative delivery overrides the generic
+            # "private school suspended" interpretation.
+            scores["No School"] -= 20
+
+            reasons.append(
+                "QC indicates Alternative Delivery Modes."
+            )
+
+    except Exception as e:
+        print(f"[GUESS] QC failed: {e}")
+
+    # --------------------------------------------------------
+    # 3. PAGASA
+    # --------------------------------------------------------
+
+    try:
+        pagasa_trigger, pagasa_reason = (
+            check_pagasa_bulletin()
+        )
+
+        if pagasa_trigger:
+            scores["Synchronous Online"] += 25
+            scores["Asynchronous Online"] += 20
+
+            reasons.append(
+                f"PAGASA: {pagasa_reason}"
+            )
+
+    except Exception as e:
+        print(f"[GUESS] PAGASA failed: {e}")
+
+    # --------------------------------------------------------
+    # 4. Recent Ateneo advisory
+    # --------------------------------------------------------
+
+    try:
+        soup, advisory_date, advisory_text = (
+            get_recent_ateneo_advisory(today)
+        )
+
+        if soup is not None:
+            text = advisory_text.lower()
+
+            if "synchronous" in text:
+                scores["Synchronous Online"] += 60
+
+                reasons.append(
+                    "Recent Ateneo advisory mentions "
+                    "synchronous learning."
+                )
+
+            if "asynchronous" in text:
+                scores["Asynchronous Online"] += 60
+
+                reasons.append(
+                    "Recent Ateneo advisory mentions "
+                    "asynchronous learning."
+                )
+
+            if (
+                "online modality" in text
+                or "online classes" in text
+                or "online learning" in text
+            ):
+                scores["Synchronous Online"] += 40
+
+                reasons.append(
+                    "Recent Ateneo advisory mentions "
+                    "online learning."
+                )
+
+            if (
+                "face-to-face" in text
+                and "suspend" in text
+            ):
+                scores["Synchronous Online"] += 25
+                scores["Asynchronous Online"] += 20
+
+                reasons.append(
+                    "Recent Ateneo advisory suspends "
+                    "face-to-face classes."
+                )
+
+            if advisory_date:
+                reasons.append(
+                    f"Advisory date: {advisory_date}"
+                )
+
+    except Exception as e:
+        print(f"[GUESS] Ateneo failed: {e}")
+
+    # --------------------------------------------------------
+    # 5. Facebook
+    # --------------------------------------------------------
+
+    try:
+        facebook_suspension = (
+            check_facebook_private_suspension()
+        )
+
+        if facebook_suspension:
+            scores["No School"] += 15
+
+            reasons.append(
+                "Ateneo Facebook appears to indicate "
+                "a private-school suspension."
+            )
+
+    except Exception as e:
+        print(f"[GUESS] Facebook failed: {e}")
+
+    # --------------------------------------------------------
+    # 6. Choose result
+    # --------------------------------------------------------
+
+    # Don't allow a negative score.
+    scores = {
+        status: max(0, score)
+        for status, score in scores.items()
+    }
+
+    best_status = max(
+        scores,
+        key=scores.get,
+    )
+
+    best_score = scores[best_status]
+
+    # Nothing useful at all.
+    if best_score <= 0:
+        return (
+            "Unknown",
+            0,
+            reasons,
+            scores,
+        )
+
+    # Convert our evidence score to a more readable percentage.
+    #
+    # 100 = extremely strong evidence.
+    # We don't claim mathematical probability here.
+    confidence = min(
+        99,
+        max(
+            50,
+            int(best_score),
+        ),
+    )
+
+    return (
+        best_status,
+        confidence,
+        reasons,
+        scores,
+    )
+
+
+def format_guessed_status(status, confidence):
+    if status == "Unknown":
+        return "Guess: Unknown (no idea)"
+
+    return f"Guess: {status} ({confidence}% sure)"
+
+
+# ============================================================
+# MESSAGE
+# ============================================================
+
+def create_message(
+    today,
+    statuses,
+    tomorrow_guess,
+    tomorrow_confidence,
+):
+    tomorrow_display = format_guessed_status(
+        tomorrow_guess,
+        tomorrow_confidence,
+    )
+
+    return (
+        f"📚 Ateneo School Status\n\n"
+        f"Today — {today.strftime('%B %d, %Y')}\n"
+        f"• AGS: {statuses['ags']}\n"
+        f"• JHS: {statuses['jhs']}\n"
+        f"• SHS: {statuses['shs']}\n\n"
+        f"Tomorrow — "
+        f"{(today + timedelta(days=1)).strftime('%B %d, %Y')}\n"
+        f"• {tomorrow_display}"
+    )
 
 
 # ============================================================
 # GOOGLE CHAT
 # ============================================================
 
-def send_to_google_chat(
-    message,
-):
+def send_to_google_chat(message):
     if not WEBHOOK_URL:
-        raise RuntimeError(
-            "GOOGLE_CHAT_WEBHOOK secret "
-            "is not set."
+        print("[CHAT] GOOGLE_CHAT_WEBHOOK is not set.")
+        print(message)
+        return False
+
+    try:
+        response = requests.post(
+            WEBHOOK_URL,
+            json={"text": message},
+            timeout=20,
         )
 
-    SESSION.post(
-        WEBHOOK_URL,
-        json={
-            "text": message,
-        },
-        timeout=30,
-    ).raise_for_status()
+        response.raise_for_status()
+
+        print("[CHAT] Message sent successfully.")
+        return True
+
+    except Exception as e:
+        print(f"[CHAT] Failed to send message: {e}")
+        return False
 
 
 # ============================================================
-# MAIN DECISION ENGINE
+# MAIN
 # ============================================================
 
 def check_once():
     today = get_ph_date()
 
+    print()
+    print("=" * 60)
     print(
-        f"[DEBUG] Philippine date: {today}"
+        f"School status check — "
+        f"{today.strftime('%B %d, %Y')}"
     )
+    print("=" * 60)
 
     # --------------------------------------------------------
-    # 1. Philippine calendar
+    # TODAY: Calendar
     # --------------------------------------------------------
 
-    (
-        calendar_no_classes,
-        calendar_reason,
-    ) = check_ph_calendar(
-        today
+    calendar_closed, calendar_reason = (
+        check_ph_calendar(today)
     )
 
-    if calendar_no_classes:
+    if calendar_closed:
         statuses = {
-            school: "No School"
-            for school in (
-                "AGS",
-                "JHS",
-                "SHS",
-            )
+            "ags": "No School",
+            "jhs": "No School",
+            "shs": "No School",
         }
 
-        send_to_google_chat(
-            create_message(
-                today,
-                statuses,
-                calendar_reason,
-                "calendar",
-            )
+        print(
+            f"[TODAY] No School — {calendar_reason}"
         )
 
-        return
+    else:
+        # ----------------------------------------------------
+        # QC
+        # ----------------------------------------------------
 
-    # --------------------------------------------------------
-    # 2. QC government announcements
-    # --------------------------------------------------------
+        qc_result = check_qc_government_feed(today)
 
-    qc_result = (
-        check_qc_government_feed(
-            today
+        print(
+            f"[DEBUG] QC private suspended: "
+            f"{qc_result['private_suspended']}"
         )
-    )
 
-    # --------------------------------------------------------
-    # 3. PAGASA
-    # --------------------------------------------------------
+        print(
+            f"[DEBUG] QC alternative delivery: "
+            f"{qc_result['alternative_delivery']}"
+        )
 
-    (
-        pagasa_trigger,
-        pagasa_reason,
-    ) = check_pagasa_bulletin(
-        today
-    )
+        # ----------------------------------------------------
+        # PAGASA
+        # ----------------------------------------------------
 
-    print(
-        "[DEBUG] PAGASA trigger: "
-        f"{pagasa_trigger}"
-    )
+        pagasa_trigger, pagasa_reason = (
+            check_pagasa_bulletin()
+        )
 
-    print(
-        "[DEBUG] PAGASA reason: "
-        f"{pagasa_reason}"
-    )
+        print(
+            f"[DEBUG] PAGASA trigger: "
+            f"{pagasa_trigger}"
+        )
 
-    # --------------------------------------------------------
-    # 4. Recent Ateneo advisory
-    #
-    # IMPORTANT:
-    # We no longer require advisory_date == today.
-    # Anything within the previous 7 days is considered.
-    # --------------------------------------------------------
+        print(
+            f"[DEBUG] PAGASA reason: "
+            f"{pagasa_reason}"
+        )
 
-    ateneo_soup = None
-    ateneo_date = None
+        # ----------------------------------------------------
+        # Ateneo
+        # ----------------------------------------------------
 
-    try:
         (
             ateneo_soup,
-            ateneo_date,
-        ) = get_recent_ateneo_advisory(
-            today
-        )
+            advisory_date,
+            advisory_text,
+        ) = get_recent_ateneo_advisory(today)
 
-    except Exception as error:
-        print(
-            "[WARNING] Ateneo advisory check "
-            f"failed: {error}",
-            file=sys.stderr,
-        )
-
-    # --------------------------------------------------------
-    # 5. Facebook fallback
-    # --------------------------------------------------------
-
-    facebook_result = check_facebook(
-        today
-    )
-
-    # --------------------------------------------------------
-    # DEBUG
-    # --------------------------------------------------------
-
-    print(
-        "========== DECISION DEBUG =========="
-    )
-
-    print(
-        "[DEBUG] QC private suspended: "
-        f"{qc_result['private_suspended']}"
-    )
-
-    print(
-        "[DEBUG] QC alternative delivery: "
-        f"{qc_result['alternative_delivery']}"
-    )
-
-    print(
-        "[DEBUG] QC reason: "
-        f"{qc_result['reason']}"
-    )
-
-    if qc_result["announcement"]:
-        announcement = (
-            qc_result["announcement"]
-        )
-
-        print(
-            "[DEBUG] QC announcement title: "
-            f"{announcement['title']}"
-        )
-
-        print(
-            "[DEBUG] QC announcement date: "
-            f"{announcement['date']}"
-        )
-
-        print(
-            "[DEBUG] QC announcement URL: "
-            f"{announcement['url']}"
-        )
-
-    print(
-        "[DEBUG] Facebook suspension: "
-        f"{bool(facebook_result)}"
-    )
-
-    print(
-        "[DEBUG] Ateneo advisory date: "
-        f"{ateneo_date}"
-    )
-
-    print(
-        "[DEBUG] Ateneo recent: "
-        f"{ateneo_soup is not None}"
-    )
-
-    print(
-        "[DEBUG] PAGASA trigger: "
-        f"{pagasa_trigger}"
-    )
-
-    print(
-        "===================================="
-    )
-
-    # --------------------------------------------------------
-    # 6. Get Facebook/QC suspension signals
-    # --------------------------------------------------------
-
-    private_suspended = (
-        qc_result["private_suspended"]
-        or bool(facebook_result)
-    )
-
-    # --------------------------------------------------------
-    # 7. Default state
-    # --------------------------------------------------------
-
-    statuses = {
-        school: "Onsite"
-        for school in (
-            "AGS",
-            "JHS",
-            "SHS",
-        )
-    }
-
-    reason = None
-    reason_type = None
-
-    # --------------------------------------------------------
-    # 8. CRITICAL PRECEDENCE
-    #
-    # Alternative Delivery Mode OVERRIDES a generic
-    # private-school suspension signal.
-    #
-    # Example:
-    #
-    # QC:
-    #   private schools suspended
-    #   alternative delivery modes
-    #
-    # Ateneo:
-    #   synchronous online
-    #
-    # RESULT:
-    #   synchronous online
-    #
-    # But:
-    #
-    # QC:
-    #   private schools suspended
-    #   NO alternative delivery
-    #
-    # RESULT:
-    #   No School
-    # --------------------------------------------------------
-
-    if (
-        private_suspended
-        and not qc_result[
-            "alternative_delivery"
-        ]
-    ):
-        statuses = {
-            school: "No School"
-            for school in (
-                "AGS",
-                "JHS",
-                "SHS",
+        if advisory_soup := ateneo_soup:
+            statuses = get_statuses(
+                advisory_soup
             )
-        }
+        else:
+            statuses = {
+                "ags": "Onsite",
+                "jhs": "Onsite",
+                "shs": "Onsite",
+            }
 
-        if qc_result[
-            "private_suspended"
-        ]:
-            reason = qc_result[
-                "reason"
-            ]
+        # ----------------------------------------------------
+        # Facebook
+        # ----------------------------------------------------
 
-        elif facebook_result:
-            reason = facebook_result[
-                "reason"
-            ]
-
-        reason_type = "suspension"
-
-        print(
-            "[DEBUG] Decision: "
-            "PRIVATE-SCHOOL SUSPENSION"
+        facebook_suspension = (
+            check_facebook_private_suspension()
         )
 
-    # --------------------------------------------------------
-    # 9. Alternative delivery / PAGASA
-    #
-    # If either source indicates a weather-related event,
-    # use the recent Ateneo advisory.
-    # --------------------------------------------------------
+        print(
+            f"[DEBUG] Facebook private suspension: "
+            f"{facebook_suspension}"
+        )
 
-    elif (
-        qc_result[
-            "alternative_delivery"
-        ]
-        or pagasa_trigger
-    ):
-        if ateneo_soup is not None:
+        # ----------------------------------------------------
+        # DECISION ENGINE
+        # ----------------------------------------------------
+
+        private_suspended = (
+            qc_result["private_suspended"]
+            or facebook_suspension
+        )
+
+        # IMPORTANT:
+        #
+        # Private-school suspension alone:
+        #     -> No School
+        #
+        # Private-school suspension + Alternative Delivery:
+        #     -> Alternative Delivery wins
+        #     -> inspect Ateneo advisory instead
+        #
+        if (
+            private_suspended
+            and not qc_result["alternative_delivery"]
+        ):
+            statuses = {
+                "ags": "No School",
+                "jhs": "No School",
+                "shs": "No School",
+            }
+
             print(
-                "[DEBUG] Decision: "
-                "RECENT ATENEO ADVISORY "
-                "OVERRIDES GENERIC "
-                "SUSPENSION SIGNAL"
+                "[TODAY] Private-school suspension "
+                "without alternative delivery -> No School"
             )
 
+        elif (
+            qc_result["alternative_delivery"]
+            or pagasa_trigger
+        ):
+            if ateneo_soup is not None:
+                statuses = get_statuses(
+                    ateneo_soup
+                )
+
+                print(
+                    "[TODAY] Alternative delivery/weather "
+                    "signal -> using recent Ateneo advisory"
+                )
+
+            else:
+                statuses = {
+                    "ags": "Unknown",
+                    "jhs": "Unknown",
+                    "shs": "Unknown",
+                }
+
+                print(
+                    "[TODAY] Signal detected but no recent "
+                    "Ateneo advisory found."
+                )
+
+        elif ateneo_soup is not None:
             statuses = get_statuses(
                 ateneo_soup
             )
 
-        else:
             print(
-                "[WARNING] Weather/alternative "
-                "delivery trigger detected, "
-                "but no recent Ateneo advisory "
-                "was found."
+                "[TODAY] Using recent Ateneo advisory."
             )
 
+        else:
             statuses = {
-                school: "Unknown"
-                for school in (
-                    "AGS",
-                    "JHS",
-                    "SHS",
-                )
+                "ags": "Onsite",
+                "jhs": "Onsite",
+                "shs": "Onsite",
             }
 
-    # --------------------------------------------------------
-    # 10. Normal case
-    #
-    # If Ateneo has a recent advisory, use it.
-    # --------------------------------------------------------
-
-    elif ateneo_soup is not None:
-        print(
-            "[DEBUG] Decision: "
-            "RECENT ATENEO ADVISORY"
-        )
-
-        statuses = get_statuses(
-            ateneo_soup
-        )
+            print(
+                "[TODAY] No relevant advisory -> Onsite"
+            )
 
     # --------------------------------------------------------
-    # 11. No useful advisory
+    # TOMORROW GUESS
     # --------------------------------------------------------
 
+    (
+        tomorrow_guess,
+        tomorrow_confidence,
+        guess_reasons,
+        guess_scores,
+    ) = guess_tomorrow_status(today)
+
+    tomorrow_display = format_guessed_status(
+        tomorrow_guess,
+        tomorrow_confidence,
+    )
+
+    print()
+    print("=" * 60)
+    print("TOMORROW GUESS")
+    print("=" * 60)
+
+    print(f"Guess: {tomorrow_display}")
+
+    print()
+    print("Scores:")
+
+    for status, score in guess_scores.items():
+        print(f"  {status}: {score}")
+
+    print()
+    print("Reasons:")
+
+    if guess_reasons:
+        for reason in guess_reasons:
+            print(f"  - {reason}")
     else:
-        print(
-            "[DEBUG] Decision: "
-            "NO RECENT ATENEO ADVISORY; "
-            "DEFAULTING TO ONSITE"
-        )
+        print("  - No useful public information found.")
+
+    print("=" * 60)
 
     # --------------------------------------------------------
-    # 12. Final debug
+    # MESSAGE
     # --------------------------------------------------------
 
-    print(
-        "========== FINAL STATUS =========="
+    message = create_message(
+        today,
+        statuses,
+        tomorrow_guess,
+        tomorrow_confidence,
     )
 
-    for school in (
-        "AGS",
-        "JHS",
-        "SHS",
-    ):
-        print(
-            f"[DEBUG] {school}: "
-            f"{statuses[school]}"
-        )
+    print()
+    print(message)
+    print()
 
-    print(
-        "=================================="
-    )
+    send_to_google_chat(message)
 
-    # --------------------------------------------------------
-    # 13. Send
-    # --------------------------------------------------------
-
-    send_to_google_chat(
-        create_message(
-            today,
-            statuses,
-            reason,
-            reason_type,
-        )
-    )
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
-    try:
-        check_once()
-
-    except Exception as error:
-        print(
-            f"ERROR: {error}",
-            file=sys.stderr,
-        )
-
-        sys.exit(1)
+    check_once()
