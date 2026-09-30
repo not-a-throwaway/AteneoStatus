@@ -229,7 +229,7 @@ def A5(target_date=B):
 				if G:J[G[R]]=G
 			F=n(J.values())
 	if not F:A('[QC] No relevant announcement found.');return{X:E,N:E,u:B,T:B,U:B,R:B}
-	F.sort(key=lambda x:x[U],reverse=C);D=F[0];L=D[s]and D[t];O=D[N];A(f"[QC] Newest announcement: {D[T]or'(untitled)'}");A(f"[QC] Date: {D[U]}");A(f"[QC] Private school: {D[s]}");A(f"[QC] Suspended: {D[t]}");A(f"[QC] Alternative delivery: {D[N]}");A(f"[QC] URL: {D[R]}");return{X:L,N:O,u:'Private-school suspension + Alternative Delivery Modes'if L and O else'Private-school suspension'if L else'Alternative Delivery Modes'if O else B,T:D[T],U:D[U],R:D[R]}
+	F.sort(key=lambda x:x[U],reverse=C);D=F[0];L=D[s]and D[t];O=D[N];A(f"[QC] Newest announcement: {D[T]or"(untitled)"}");A(f"[QC] Date: {D[U]}");A(f"[QC] Private school: {D[s]}");A(f"[QC] Suspended: {D[t]}");A(f"[QC] Alternative delivery: {D[N]}");A(f"[QC] URL: {D[R]}");return{X:L,N:O,u:'Private-school suspension + Alternative Delivery Modes'if L and O else'Private-school suspension'if L else'Alternative Delivery Modes'if O else B,T:D[T],U:D[U],R:D[R]}
 def A6():
 	A=S(Ac)
 	if not A:return E,B
