@@ -885,23 +885,30 @@ def check_pagasa_bulletin():
 # FACEBOOK
 # ============================================================
 
-def check_facebook_private_suspension():
-    response = fetch(FACEBOOK_URL)
+def check_facebook_private_suspension(target_date=None):
+    """
+    Facebook is a noisy source: its page can contain older posts and
+    cached text, so a generic "no classes" + "Ateneo" match is NOT
+    enough to cancel school.
 
+    We only return True when the page contains a date matching
+    target_date (or, if no date is supplied, today's date) alongside
+    an explicit suspension statement.
+    """
+    if target_date is None:
+        target_date = get_ph_date()
+
+    response = fetch(FACEBOOK_URL)
     if not response:
         return False
 
-    soup = BeautifulSoup(
-        response.text,
-        "html.parser",
-    )
-
-    text = normalize_text(
-        soup.get_text(" ", strip=True)
-    ).lower()
+    soup = BeautifulSoup(response.text, "html.parser")
+    text = normalize_text(soup.get_text(" ", strip=True))
 
     if not text:
         return False
+
+    lower = text.lower()
 
     suspension_terms = [
         "no classes",
@@ -909,28 +916,25 @@ def check_facebook_private_suspension():
         "class suspension",
         "walang pasok",
         "suspension of classes",
+        "suspension ng klase",
     ]
 
-    private_terms = [
-        "private schools",
-        "private school",
-        "ateneo",
-    ]
+    if not any(term in lower for term in suspension_terms):
+        return False
 
-    has_suspension = any(
-        term in text
-        for term in suspension_terms
-    )
+    # Never treat an undated Facebook page as a current suspension.
+    dates = extract_dates(text)
+    if target_date not in dates:
+        print(
+            "[FACEBOOK] Suspension language found, but no matching "
+            f"date for {target_date}; ignoring it."
+        )
+        return False
 
-    has_private = any(
-        term in text
-        for term in private_terms
+    print(
+        f"[FACEBOOK] Explicit suspension dated {target_date} found."
     )
-
-    return (
-        has_suspension
-        and has_private
-    )
+    return True
 
 
 # ============================================================
@@ -960,14 +964,21 @@ def guess_school_tomorrow(
 
     tomorrow = today + timedelta(days=1)
 
+    # In the absence of a closure/online announcement, the normal
+    # school-day state is Onsite. "Unknown" should only be used when
+    # the source data itself is unavailable, not simply because no
+    # special announcement was found.
     scores = {
         "Synchronous Online": 0,
         "Asynchronous Online": 0,
         "No School": 0,
-        "Onsite": 0,
+        "Onsite": 55,
     }
 
-    reasons = []
+    reasons = [
+        "No explicit closure or online arrangement found; "
+        "defaulting to normal onsite classes."
+    ]
 
     # --------------------------------------------------------
     # Calendar
@@ -1199,7 +1210,8 @@ def guess_school_tomorrow(
 
     best_score = scores[best_status]
 
-    # If absolutely no useful evidence exists.
+    # Onsite has a normal-school baseline, so an ordinary day no longer
+    # becomes "Unknown" just because there is no special announcement.
     if best_score <= 0:
         return (
             "Unknown",
@@ -1466,7 +1478,7 @@ def check_once():
         # ====================================================
 
         facebook_suspension = (
-            check_facebook_private_suspension()
+            check_facebook_private_suspension(today)
         )
 
         print(
@@ -1575,7 +1587,7 @@ def check_once():
     )
 
     tomorrow_facebook = (
-        check_facebook_private_suspension()
+        check_facebook_private_suspension(tomorrow)
     )
 
     tomorrow_guesses = guess_tomorrow_statuses(
